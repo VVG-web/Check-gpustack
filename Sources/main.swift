@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var historyWindow: NSWindow?
     private var historyModel: HistoryModel?
     private var settingsWindow: NSWindow?
+    private var helpWindow: NSWindow?
     private var settingsModel: SettingsModel?
     private let work = DispatchQueue(label: "gpustack.monitor", qos: .utility)
 
@@ -153,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(menu, "История доступности…", #selector(openHistory), key: "h")
         add(menu, "Проверить сейчас", #selector(checkNow), key: "r")
         add(menu, "Настройки…", #selector(openSettings), key: ",")
+        add(menu, "Справка", #selector(openHelp), key: "?")
         menu.addItem(.separator())
         add(menu, "Выйти", #selector(quit), key: "q")
     }
@@ -267,6 +269,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         w.center(); w.isReleasedWhenClosed = false
         m.close = { [weak w] in w?.close() }
         settingsWindow = w
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func openHelp() {
+        if let w = helpWindow {
+            w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
+        }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Справка"
+        w.contentViewController = NSHostingController(rootView: HelpView())
+        w.center(); w.isReleasedWhenClosed = false
+        helpWindow = w
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
