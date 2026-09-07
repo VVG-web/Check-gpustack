@@ -18,6 +18,17 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O -o "$BIN" Sources/*.swift
 
+# Иконка. Нет .icns — рисуем его из Tools/make-icon.swift: рисунок один, размеры от 16
+# до 1024 получаются из него. Без иконки приложение выглядит белым пятном в Launchpad.
+if [ ! -f Resources/AppIcon.icns ]; then
+  echo "Рисую иконку…"
+  swiftc -O Tools/make-icon.swift -o /tmp/gsm-make-icon
+  mkdir -p Resources
+  /tmp/gsm-make-icon Resources
+  iconutil -c icns Resources/AppIcon.iconset -o Resources/AppIcon.icns
+fi
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,6 +38,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>GPUStack Монитор</string>
   <key>CFBundleIdentifier</key><string>local.gpustack.monitor</string>
   <key>CFBundleExecutable</key><string>GPUStackMonitor</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>

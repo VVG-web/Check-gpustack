@@ -5,4 +5,7 @@ monitor.local.env
 *.app/
 *.dmg
 
+# Промежуточная папка иконки: из неё iconutil делает .icns, который лежит рядом.
+Resources/AppIcon.iconset/
+
 .DS_Store
