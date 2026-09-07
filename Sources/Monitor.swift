@@ -18,9 +18,19 @@ final class Monitor {
     /// Найденный вид модели переживает перезапуск: искать его заново значит слать на
     /// кластер лишние запросы каждый раз, когда человек перезагрузил ноутбук.
     private var kinds: [String: Kind] = [:]
-    /// Почему модель попала в «не проверяются». Молчание и честный 404 — разные поводы,
-    /// и первый стоит перепроверить по просьбе человека, а второй нет.
+    /// Почему и когда модель попала в «не проверяются»: `"404@<unix>"`, `"молчание@<unix>"`.
+    ///
+    /// Время здесь не для отчётности. Первая версия считала такую отметку вечной, и на
+    /// живом шлюзе это вышло боком: `deepseek-v4-flash` — обычная чат-модель — ответила
+    /// 404 на все три маршрута ровно в минуту разбора (GPUStack выгружает простаивающие
+    /// модели и на запрос к невыгруженной отвечает 404, пока её ставит обратно). Модель
+    /// осталась в «не проверяется» навсегда, хотя через минуту отвечала за треть секунды.
+    ///
+    /// Вывод: «не проверяется» не бывает вечным. Отметка пересматривается раз в сутки.
     private var untestedWhy: [String: String] = [:]
+
+    /// Через сколько перепроверять тех, кого записали в «не проверяются».
+    private let recheckUntested: TimeInterval = 24 * 3600
     private let kindsFile = Config.dir.appendingPathComponent("kinds.json")
     private let whyFile = Config.dir.appendingPathComponent("untested.json")
 
@@ -36,6 +46,13 @@ final class Monitor {
     /// и по полминуты.
     private let probeTimeout: TimeInterval = 60
 
+    /// Очередь только для сети. Общего состояния она не касается — см. раздел «сеть».
+    private let io = DispatchQueue(label: "gpustack.io", qos: .utility)
+    /// Идёт ли опрос прямо сейчас: второй поверх первого удвоил бы нагрузку.
+    private var probing = false
+    /// Спрашивали ли модели хоть раз с запуска.
+    private(set) var probedOnce = false
+
     var onChange: (() -> Void)?
 
     init(config: Config) {
@@ -49,29 +66,44 @@ final class Monitor {
         Log.say("запуск · адрес \(config.url) · ключ \(config.key.isEmpty ? "не задан" : "есть")")
     }
 
-    func apply(_ c: Config) { config = c; c.save() }
-
+    func apply(_ c: Config) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        config = c
+        c.save()
+    }
     // ------------------------------------------------------------------ сеть
+    //
+    // Разделение труда здесь не стилистическое, а вынужденное.
+    //
+    // Приложение падало примерно раз в сутки — четыре отчёта, все одинаковые: SIGABRT в
+    // `Monitor.probe` на записи в словарь, `swift_deallocClassInstance`. Это подпись
+    // гонки данных: сетевой поток правил `models`, а главный в ту же секунду читал их,
+    // собирая меню. Словари Swift к такому не готовы, и ломается не логика, а счётчик
+    // ссылок — то есть падает не там, где ошибка, и не сразу.
+    //
+    // Правило теперь одно: **состояние живёт на главном потоке**. Очередь `io` умеет
+    // только ходить в сеть и возвращать результат; ничего общего она не трогает.
+    // `dispatchPrecondition` в местах записи делает нарушение этого правила громким и
+    // немедленным, а не тихим и отложенным на сутки.
 
     /// Один запрос к шлюзу. → (код, тело, ошибка, секунды).
     ///
-    /// Через `curl`, а не через URLSession — и это не вкусовщина.
+    /// Статический нарочно: у него нет доступа к состоянию, и добавить туда чтение
+    /// `config` мимоходом уже не выйдет — адрес и ключ приходят снимком.
     ///
-    /// При отладке этого монитора на живой машине URLSession и Network.framework не
-    /// достучались НИКУДА: ни до apple.com, ни до сервера в собственной подсети. В ту же
-    /// секунду `curl` и обычный сокет получали от обоих 200 за десятые доли секунды.
-    /// Монитор на таком транспорте показал бы «недоступно всё» при исправной сети — то
-    /// есть соврал бы ровно там, ради чего его и заводят.
-    ///
-    /// `curl` есть на каждом маке, ходит теми же сокетами, что и остальные программы, и
-    /// отвечает за сервер, а не за мнение сетевого стека о самом себе.
-    private func request(_ path: String, body: [String: Any]?, timeout: TimeInterval)
+    /// Через `curl`, а не через URLSession. При отладке на живой машине URLSession и
+    /// Network.framework не достучались никуда — ни до apple.com, ни до сервера в
+    /// собственной подсети, — тогда как `curl` и обычный сокет получали от обоих 200 за
+    /// десятые доли секунды. Монитор на таком транспорте показывал бы «недоступно всё»
+    /// при исправной сети, то есть врал бы ровно там, ради чего его заводят.
+    private static func request(url: String, key: String, body: [String: Any]?,
+                                timeout: TimeInterval)
         -> (status: Int?, data: Data?, error: String, seconds: Double) {
         let t0 = Date()
         // Ключ и тело не уходят в аргументы команды: `ps` показывает их всей машине.
         // Настройки curl читает со стандартного ввода, тело — из файла с правами 0600.
         var options = """
-        url = "\(config.url + path)"
+        url = "\(url)"
         silent
         show-error
         max-time = \(Int(timeout))
@@ -79,8 +111,8 @@ final class Monitor {
         header = "Content-Type: application/json"
 
         """
-        if !config.key.isEmpty {
-            options += "header = \"Authorization: Bearer \(config.key)\"\n"
+        if !key.isEmpty {
+            options += "header = \"Authorization: Bearer \(key)\"\n"
         }
         var bodyFile: URL?
         if let body, let data = try? JSONSerialization.data(withJSONObject: body) {
@@ -131,36 +163,53 @@ final class Monitor {
         return (code, payload.data(using: .utf8), "", dt)
     }
 
-    /// Версия GPUStack лежит вне `/v1` — на корне хоста. Спрашиваем один раз: она не
-    /// меняется между опросами, а лишний запрос в минуту ради неизменной строки лишний.
-    private func refreshVersion() {
-        guard var base = URL(string: config.url) else { return }
+    /// Версия GPUStack лежит вне `/v1` — на корне хоста.
+    private static func fetchVersion(url: String, key: String) -> String? {
+        guard var base = URL(string: url) else { return nil }
         while base.lastPathComponent == "v1" || base.lastPathComponent == "v1-openai" {
             base = base.deletingLastPathComponent()
         }
-        let saved = config.url
-        config.url = base.absoluteString.hasSuffix("/")
-            ? String(base.absoluteString.dropLast()) : base.absoluteString
-        let (st, data, _, _) = request("/version", body: nil, timeout: 10)
-        config.url = saved
-        if st == 200, let data,
-           let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let v = j["version"] as? String { version = v }
+        let (st, data, _, _) = request(url: base.appendingPathComponent("version").absoluteString,
+                                       key: key, body: nil, timeout: 10)
+        guard st == 200, let data,
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return j["version"] as? String
     }
 
     // ------------------------------------------------------- список моделей
 
     /// Кто числится на шлюзе. Дёшево: обычный GET, генерации нет.
+    ///
+    /// Вызывается с главного потока: снимок настройки берётся здесь, запрос уходит в
+    /// `io`, результат возвращается сюда же.
     func refreshRoster() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let cfg = config
         // Свежая установка: адреса ещё нет. Молчать нельзя — иначе значок покажет «✗»,
         // и человек пойдёт искать обрыв связи вместо пустого поля в настройках.
-        guard !config.url.trimmingCharacters(in: .whitespaces).isEmpty else {
+        guard !cfg.url.trimmingCharacters(in: .whitespaces).isEmpty else {
             gatewayOK = false
             gatewayWhy = "шлюз не указан — впишите адрес в «Настройках…»"
-            notify()
+            onChange?()
             return
         }
-        let (st, data, err, _) = request("/models", body: nil, timeout: 15)
+        let needVersion = version.isEmpty
+        io.async { [weak self] in
+            let (st, data, err, _) = Self.request(url: cfg.url + "/models", key: cfg.key,
+                                                  body: nil, timeout: 15)
+            let ver = (st == 200 && needVersion)
+                ? Self.fetchVersion(url: cfg.url, key: cfg.key) : nil
+            DispatchQueue.main.async {
+                self?.applyRoster(status: st, data: data, error: err, version: ver, cfg: cfg)
+            }
+        }
+    }
+
+    private func applyRoster(status st: Int?, data: Data?, error err: String,
+                             version ver: String?, cfg: Config) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if let ver { version = ver }
         if st != 200 {
             Log.say("список моделей не получен: " + (st == nil ? err : "HTTP \(st!)"))
             gatewayOK = false
@@ -169,7 +218,7 @@ final class Monitor {
             // Называем обе, а не одну: при отладке этого монитора я уверенно объявил
             // виновным разрешение macOS, а на деле пропал маршрут в корпоративную сеть —
             // обычный сокет из терминала молчал точно так же.
-            if st == nil, isPrivateHost {
+            if st == nil, Self.isPrivate(host: cfg.url) {
                 gatewayWhy += " · адрес внутренний: проверьте, есть ли сеть до него "
                     + "(VPN), и разрешён ли приложению доступ к локальной сети "
                     + "(Системные настройки → Конфиденциальность)"
@@ -177,16 +226,14 @@ final class Monitor {
             // Шлюз молчит — значит, ни одна модель сейчас не доступна, и показывать
             // прошлые зелёные галочки нельзя: они соврут ровно тогда, когда важны.
             for name in order { models[name]?.health = .failed; models[name]?.why = gatewayWhy }
-            notify()
+            onChange?()
             return
         }
         gatewayOK = true
         gatewayWhy = ""
-        if version.isEmpty { refreshVersion() }
-
         guard let data,
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let list = j["data"] as? [[String: Any]] else { notify(); return }
+              let list = j["data"] as? [[String: Any]] else { onChange?(); return }
 
         var fresh: [String] = []
         for item in list {
@@ -203,64 +250,207 @@ final class Monitor {
         // Держать её в перечне значит копить мусор и пугать красным тем, чего уже нет.
         for gone in order where !fresh.contains(gone) { models.removeValue(forKey: gone) }
         order = fresh.sorted { $0.lowercased() < $1.lowercased() }
-        if lastRoster == nil { Log.say("список моделей: \(order.count)") }
+        let first = lastRoster == nil
+        if first { Log.say("список моделей: \(order.count)") }
         lastRoster = Date()
-        notify()
+        onChange?()
+        // Первый настоящий опрос идёт сразу за первым списком, а не по расписанию.
+        // Раньше он звался следом за `refreshRoster()`, но список теперь приходит из
+        // сети асинхронно — и опрос уходил в пустоту, а результатов пришлось бы ждать
+        // пятнадцать минут.
+        if first, !order.isEmpty, !probedOnce { probeAll() }
     }
 
     // ---------------------------------------------------- настоящий запрос
 
+    /// Что вышло из опроса одной модели. Считается в `io`, применяется на главном.
+    private struct Outcome {
+        var kind: Kind
+        var health: Health
+        var ms: Int
+        var why: String
+        var untestedReason: String?
+    }
+
     /// Спросить каждую модель по-настоящему. Идёт долго и нагружает кластер — поэтому
     /// вызывается редко и последовательно, а не всеми двадцатью четырьмя разом.
+    ///
     /// `rediscover` — забыть вид у тех, кого записали в «не проверяются» по молчанию.
     /// Честный 404 не пересматриваем: у эмбеддингов чата не появится.
     func probeAll(rediscover: Bool = false) {
-        if rediscover {
-            for (name, why) in untestedWhy where why.hasPrefix("молчание") {
-                kinds.removeValue(forKey: name)
-                untestedWhy.removeValue(forKey: name)
-                models[name]?.kind = .unknown
+        dispatchPrecondition(condition: .onQueue(.main))
+        // Второй проход поверх первого удвоил бы нагрузку на общий кластер и перемешал
+        // бы записи в истории. Один опрос за раз.
+        guard !probing else { Log.say("опрос уже идёт — второй не начинаю"); return }
+        probing = true
+        // Кого пересматриваем. По кнопке — всех: человек нажал её именно потому, что
+        // сомневается. По расписанию — тех, чья отметка старше суток, и тех, у кого
+        // времени нет вовсе (отметки прежних версий: они и были вечными).
+        let now = Date().timeIntervalSince1970
+        for (name, mark) in untestedWhy {
+            let stamped = mark.split(separator: "@").last.flatMap { Double($0) }
+            let stale = stamped.map { now - $0 > recheckUntested } ?? true
+            guard rediscover || stale else { continue }
+            kinds.removeValue(forKey: name)
+            untestedWhy.removeValue(forKey: name)
+            models[name]?.kind = .unknown
+            Log.say("пересматриваю «не проверяется» у \(name)"
+                    + (rediscover ? " — по кнопке" : " — отметке больше суток"))
+        }
+        let cfg = config
+        let plan: [(String, Kind)] = order.compactMap {
+            guard let s = models[$0] else { return nil }
+            return ($0, s.kind)
+        }
+        io.async { [weak self] in
+            for (name, kind) in plan {
+                guard let self else { return }
+                let outcome = Self.probeOne(name: name, kind: kind, cfg: cfg,
+                                            discoverTimeout: self.discoverTimeout,
+                                            probeTimeout: self.probeTimeout,
+                                            store: self.store,
+                                            knownReason: nil)
+                DispatchQueue.main.async { self.applyProbe(name: name, outcome: outcome) }
             }
+            DispatchQueue.main.async { self?.finishProbe() }
         }
-        for name in order {
-            probe(name)
-            notify()
-        }
+    }
+
+    private func applyProbe(name: String, outcome: Outcome) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard var s = models[name] else { return }   // модель сняли со шлюза, пока спрашивали
+        s.kind = outcome.kind
+        s.health = outcome.health
+        s.ms = outcome.ms
+        s.why = outcome.why
+        s.checked = Date()
+        models[name] = s
+        kinds[name] = outcome.kind
+        if let reason = outcome.untestedReason { untestedWhy[name] = reason }
+        onChange?()
+    }
+
+    private func finishProbe() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        probing = false
+        probedOnce = true
         lastProbe = Date()
         let bad = failing
         Log.say("опрос: отвечают \(answering) из \(testable)"
                 + (bad.isEmpty ? "" : " · не в порядке: "
                    + bad.map { "\($0.name) (\($0.why))" }.joined(separator: "; ")))
         saveKinds()
-        notify()
+        writeSnapshot()
+        onChange?()
     }
 
-    private func probe(_ name: String) {
-        guard var s = models[name] else { return }
-        // Вид уже известен — спрашиваем сразу по адресу. Неизвестен — ищем перебором,
-        // но один раз за всё время жизни модели.
-        let tries: [Kind] = s.kind == .unknown ? [.chat, .embedding, .rerank] : [s.kind]
-        if s.kind == .untested {
-            s.health = .listed
-            s.why = untestedWhy[name] ?? "проверка стоила бы генерации — не спрашиваем"
-            s.checked = Date()
-            models[name] = s
-            return
+    /// Снимок того, что монитор показывает прямо сейчас: значок, меню и таблица истории
+    /// одним текстовым файлом.
+    ///
+    /// Нужен затем, что окно и меню нельзя приложить к письму. Когда человек говорит
+    /// «показывает не то», в ответ обычно просят описать экран словами — а здесь этот
+    /// экран уже записан, вместе с числами, из которых он собран.
+    private func writeSnapshot() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var L: [String] = ["# Что показывает монитор — \(f.string(from: Date()))", ""]
+        let ok = answering, all = testable
+        L.append("Значок: " + (gatewayOK ? (ok == all ? "\(ok)/\(all)" : "⚠ \(ok)/\(all)")
+                                         : "GPUStack ✗"))
+        L.append("Шлюз: \(config.url)" + (version.isEmpty ? "" : " · GPUStack \(version)")
+                 + (gatewayOK ? "" : " · \(gatewayWhy)"))
+        L.append("Моделей на шлюзе: \(order.count) · проверяем \(all) · скрыто "
+                 + "\(config.hidden.count)")
+        L.append("")
+
+        L.append("## Меню значка")
+        let broken = failing.filter { !config.hiddenFromMenu($0.name) }
+        if !broken.isEmpty {
+            L.append("### Требуют внимания")
+            for s in broken { L.append(menuLine(s)) }
         }
-        let discovering = s.kind == .unknown
+        for kind in [Kind.chat, .embedding, .rerank, .untested, .unknown] {
+            let list = order.compactMap { models[$0] }
+                .filter { $0.kind == kind && $0.health != .failed && $0.health != .refused
+                          && !config.hiddenFromMenu($0.name) }
+            guard !list.isEmpty else { continue }
+            L.append("### \(kind.title)")
+            for s in list { L.append(menuLine(s)) }
+        }
+        let hiddenMenu = order.filter { config.hiddenFromMenu($0) }
+        if !hiddenMenu.isEmpty {
+            L.append("### Скрыто из меню: \(hiddenMenu.count)")
+            L.append("  " + hiddenMenu.joined(separator: ", "))
+        }
+
+        L.append("")
+        L.append("## Окно истории (за сутки)")
+        L.append("| модель | вид | состояние | доступность |")
+        L.append("|---|---|---|---|")
+        let since = Date().addingTimeInterval(-86400)
+        for name in order where !config.hiddenFromHistory(name) {
+            guard let s = models[name] else { continue }
+            let up = store.uptime(name, since: since)
+            let text = up.map { String(format: "%.1f %%", $0 * 100) } ?? "нет замеров"
+            L.append("| \(name) | \(s.kind.title) | \(word(s.health)) | \(text) |")
+        }
+        let hiddenHist = order.filter { config.hiddenFromHistory($0) }
+        if !hiddenHist.isEmpty {
+            L.append("")
+            L.append("Скрыто из истории: \(hiddenHist.count) — "
+                     + hiddenHist.joined(separator: ", "))
+        }
+        try? (L.joined(separator: "\n") + "\n")
+            .data(using: .utf8)?
+            .write(to: Config.dir.appendingPathComponent("snapshot.txt"), options: .atomic)
+    }
+
+    private func menuLine(_ s: ModelState) -> String {
+        let mark: String
+        switch s.health {
+        case .ok: mark = "✅"
+        case .failed: mark = "✗"
+        case .refused: mark = "⚠️"
+        case .listed: mark = "•"
+        case .unknown: mark = "…"
+        }
+        return "  \(mark) \(s.name)" + (s.health == .ok ? "  \(s.ms) мс" : "")
+            + (s.why.isEmpty ? "" : "  — \(s.why)")
+    }
+
+    private func word(_ h: Health) -> String {
+        switch h {
+        case .ok: return "отвечает"
+        case .failed: return "не отвечает"
+        case .refused: return "отвечает и отказывает"
+        case .listed: return "не проверяется"
+        case .unknown: return "ещё не спрашивали"
+        }
+    }
+
+    /// Опрос одной модели. Чистая работа: сеть и запись в историю, ничего общего.
+    private static func probeOne(name: String, kind: Kind, cfg: Config,
+                                 discoverTimeout: TimeInterval, probeTimeout: TimeInterval,
+                                 store: Store, knownReason: String?) -> Outcome {
+        if kind == .untested {
+            return Outcome(kind: .untested, health: .listed, ms: 0,
+                           why: "проверка стоила бы генерации — не спрашиваем",
+                           untestedReason: nil)
+        }
+        let discovering = kind == .unknown
+        let tries: [Kind] = discovering ? [.chat, .embedding, .rerank] : [kind]
         var silent = false
-        for kind in tries {
-            guard let path = kind.path else { continue }
-            let (st, data, err, dt) = request(path, body: payload(kind, model: name),
+
+        for try_ in tries {
+            guard let path = try_.path else { continue }
+            let (st, data, err, dt) = request(url: cfg.url + path, key: cfg.key,
+                                              body: payload(try_, model: name),
                                               timeout: discovering ? discoverTimeout : probeTimeout)
             let ms = Int(dt * 1000)
             if st == 200 {
-                s.kind = kind; kinds[name] = kind
-                s.health = .ok; s.ms = ms; s.why = ""; s.checked = Date()
-                models[name] = s
                 store.append(Sample(t: Int(Date().timeIntervalSince1970), m: name,
                                     ok: true, ms: ms, why: nil))
-                return
+                return Outcome(kind: try_, health: .ok, ms: ms, why: "", untestedReason: nil)
             }
             // 404 значит «этого маршрута для этой модели нет» — у эмбеддингов не бывает
             // чата. Ищем дальше по списку видов.
@@ -281,32 +471,27 @@ final class Monitor {
             // Ожиданием это не лечится, и одним красным с молчанием показывать нельзя.
             let why = st == nil ? err : "HTTP \(st!)" + shortBody(data)
             let refused = st != nil
-            s.health = refused ? .refused : .failed
-            s.ms = ms; s.why = why; s.checked = Date()
-            s.kind = kind; kinds[name] = kind
-            models[name] = s
             store.append(Sample(t: Int(Date().timeIntervalSince1970), m: name,
                                 ok: false, ms: ms, why: why,
                                 st: refused ? Health.refused.rawValue : nil))
-            return
+            return Outcome(kind: try_, health: refused ? .refused : .failed, ms: ms,
+                           why: why, untestedReason: nil)
         }
+
         // Ни чат, ни эмбеддинги, ни реранк — это генератор картинок, распознавание речи
         // или OCR. Настоящая проверка там стоит целой генерации, и монитор её не делает:
         // показать «в списке» честнее, чем красное «недоступна» на ровном месте.
-        s.kind = .untested; kinds[name] = .untested
-        s.health = .listed
-        // Повод записываем: по молчанию — перепроверим по кнопке, по 404 — нет.
-        s.why = silent
-            ? "молчание на пробный запрос — похоже на генератор картинок или речи; "
-              + "настоящая проверка стоила бы генерации"
-            : "не чат, не эмбеддинги и не реранк — речь, картинки или OCR; "
-              + "настоящая проверка стоила бы генерации"
-        untestedWhy[name] = silent ? "молчание" : "404"
-        s.checked = Date()
-        models[name] = s
+        return Outcome(kind: .untested, health: .listed, ms: 0,
+                       why: silent
+                           ? "молчание на пробный запрос — похоже на генератор картинок "
+                             + "или речи; настоящая проверка стоила бы генерации"
+                           : "не чат, не эмбеддинги и не реранк — речь, картинки или OCR; "
+                             + "настоящая проверка стоила бы генерации",
+                       untestedReason: (silent ? "молчание@" : "404@")
+                           + String(Int(Date().timeIntervalSince1970)))
     }
 
-    private func payload(_ kind: Kind, model: String) -> [String: Any] {
+    private static func payload(_ kind: Kind, model: String) -> [String: Any] {
         switch kind {
         case .chat:
             return ["model": model, "max_tokens": 1,
@@ -320,48 +505,41 @@ final class Monitor {
         }
     }
 
-    private func shortBody(_ data: Data?) -> String {
+    private static func shortBody(_ data: Data?) -> String {
         guard let data, let s = String(data: data, encoding: .utf8) else { return "" }
         let flat = s.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         return flat.isEmpty ? "" : ": " + String(flat.prefix(90))
     }
 
     private func saveKinds() {
+        dispatchPrecondition(condition: .onQueue(.main))
         if let d = try? JSONEncoder().encode(kinds) { try? d.write(to: kindsFile, options: .atomic) }
         if let d = try? JSONEncoder().encode(untestedWhy) { try? d.write(to: whyFile, options: .atomic) }
     }
 
-    private func notify() { DispatchQueue.main.async { self.onChange?() } }
-
-    // ------------------------------------------------------------- сводка
-
     /// Адрес шлюза во внутренней сети? Тогда у молчания есть частая и неочевидная
     /// причина — разрешение macOS, а не связь.
-    private var isPrivateHost: Bool {
-        guard let host = URL(string: config.url)?.host else { return false }
+    private static func isPrivate(host url: String) -> Bool {
+        guard let host = URL(string: url)?.host else { return false }
         if host == "localhost" || host.hasSuffix(".local") { return true }
-        let p = host.split(separator: ".").compactMap { Int($0) }
-        guard p.count == 4 else {
-            // Имя, а не адрес: разрешаем его сами — внутренние шлюзы часто прячутся за
-            // обычным доменным именем, как здесь.
-            var info = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM,
-                                ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil,
-                                ai_addr: nil, ai_next: nil)
-            var res: UnsafeMutablePointer<addrinfo>?
-            guard getaddrinfo(host, nil, &info, &res) == 0, let first = res else { return false }
-            defer { freeaddrinfo(res) }
-            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            guard getnameinfo(first.pointee.ai_addr, first.pointee.ai_addrlen,
-                              &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0
-            else { return false }
-            let ip = String(cString: buf)
-            let q = ip.split(separator: ".").compactMap { Int($0) }
-            return isPrivate(q)
-        }
-        return isPrivate(p)
+        let direct = host.split(separator: ".").compactMap { Int($0) }
+        if direct.count == 4 { return isPrivate(direct) }
+        // Имя, а не адрес: разрешаем его сами — внутренние шлюзы часто прячутся за
+        // обычным доменным именем, как здесь.
+        var info = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM,
+                            ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil,
+                            ai_addr: nil, ai_next: nil)
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &info, &res) == 0, let first = res else { return false }
+        defer { freeaddrinfo(res) }
+        var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(first.pointee.ai_addr, first.pointee.ai_addrlen,
+                          &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST) == 0
+        else { return false }
+        return isPrivate(String(cString: buf).split(separator: ".").compactMap { Int($0) })
     }
 
-    private func isPrivate(_ p: [Int]) -> Bool {
+    private static func isPrivate(_ p: [Int]) -> Bool {
         guard p.count == 4 else { return false }
         if p[0] == 10 || p[0] == 127 { return true }
         if p[0] == 192, p[1] == 168 { return true }
@@ -369,6 +547,8 @@ final class Monitor {
         if p[0] == 169, p[1] == 254 { return true }
         return false
     }
+
+    // ------------------------------------------------------------- сводка
 
     var answering: Int { models.values.filter { $0.health == .ok }.count }
     /// Знаменатель — только те, кого мы правда спрашиваем. Считать в нём картинки и

@@ -15,8 +15,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var historyModel: HistoryModel?
     private var settingsWindow: NSWindow?
     private var helpWindow: NSWindow?
+    private var firstEver = false
+    private var shownOnce = false
     private var settingsModel: SettingsModel?
-    private let work = DispatchQueue(label: "gpustack.monitor", qos: .utility)
+    // Своей очереди у приложения больше нет: монитор сам уводит сеть в фон и возвращает
+    // результат на главный поток. Раньше приложение звало его из фоновой очереди — и
+    // именно оттуда росла гонка, из-за которой оно падало раз в сутки.
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Вторая копия — это вдвое больше запросов к общему кластеру и две руки, пишущие
@@ -48,30 +52,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         redraw()
 
         schedule()
-        let firstEver = !FileManager.default.fileExists(
+        firstEver = !FileManager.default.fileExists(
             atPath: Config.dir.appendingPathComponent("history.jsonl").path)
-        work.async { [weak self] in
-            self?.monitor.refreshRoster()
-            self?.monitor.probeAll()
-            // Первый запуск на этой машине — единственный раз, когда окно показывается
-            // само. Без этого человек не узнает, что приложение работает: значка в доке
-            // нет, а значок в строке меню среди двух десятков других не бросается в
-            // глаза. Дальше окно открывается только из меню.
-            if firstEver {
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    // Свежая установка без адреса — человеку нужны настройки, а не пустая
-                    // история: показывать таблицу без единой строки и молчать о причине
-                    // значит отправить его искать, что он сделал не так.
-                    if self.monitor.config.url.trimmingCharacters(in: .whitespaces).isEmpty {
-                        self.openSettings()
-                        Log.say("первый запуск без адреса — открыл настройки")
-                    } else {
-                        self.openHistory()
-                        Log.say("первый запуск — показал историю один раз")
-                    }
-                }
-            }
+        monitor.refreshRoster()
+    }
+
+    /// Самый первый запуск на машине — единственный раз, когда окно показывается само.
+    /// Без этого человек не узнает, что приложение работает: значка в доке нет, а значок
+    /// в строке меню среди двух десятков других не бросается в глаза.
+    private func showOnFirstEverLaunch() {
+        guard firstEver, !shownOnce, monitor.probedOnce else { return }
+        shownOnce = true
+        // Свежая установка без адреса — человеку нужны настройки, а не пустая история:
+        // показывать таблицу без единой строки и молчать о причине значит отправить его
+        // искать, что он сделал не так.
+        if monitor.config.url.trimmingCharacters(in: .whitespaces).isEmpty {
+            openSettings()
+            Log.say("первый запуск без адреса — открыл настройки")
+        } else {
+            openHistory()
+            Log.say("первый запуск — показал историю один раз")
         }
     }
 
@@ -80,11 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let c = monitor.config
         rosterTimer = Timer.scheduledTimer(withTimeInterval: Double(c.rosterSeconds),
                                            repeats: true) { [weak self] _ in
-            self?.work.async { self?.monitor.refreshRoster() }
+            self?.monitor.refreshRoster()
         }
         probeTimer = Timer.scheduledTimer(withTimeInterval: Double(c.probeSeconds),
                                           repeats: true) { [weak self] _ in
-            self?.work.async { self?.monitor.probeAll() }
+            self?.monitor.probeAll()
         }
     }
 
@@ -109,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.title = all == 0 ? "GPUStack …"
             : (ok == all ? "\(ok)/\(all)" : "⚠ \(ok)/\(all)")
         button.toolTip = "Отвечают \(ok) из \(all) проверяемых моделей GPUStack"
+        showOnFirstEverLaunch()
         // Меню здесь НЕ пересобирается. Оно строится в `menuWillOpen`, то есть ровно
         // тогда, когда на него смотрят. Перестраивать его каждую минуту — это работа на
         // главном потоке ради того, чего никто не видит, а если меню в этот момент
@@ -224,10 +225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func checkNow() {
         // Ручная проверка — повод пересмотреть и тех, кого записали в «не проверяются»
         // по молчанию: человек нажал кнопку, значит сомневается именно в этом.
-        work.async { [weak self] in
-            self?.monitor.refreshRoster()
-            self?.monitor.probeAll(rediscover: true)
-        }
+        monitor.refreshRoster()
+        monitor.probeAll(rediscover: true)
     }
 
     @objc private func openHistory() {
