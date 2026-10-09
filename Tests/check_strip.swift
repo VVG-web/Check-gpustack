@@ -139,6 +139,57 @@ struct CheckStrip {
                             to: Date(timeIntervalSince1970: Double(base + 100)), buckets: 1)
         check(worst[0].health == .failed, "настоящий отказ модели по-прежнему главнее всего")
 
+        // --- сводка при наведении
+        let h = Store()
+        let hb = now - 3000
+        for (dt, ms) in [(10, 180), (20, 240), (30, 1500)] {
+            h.append(Sample(t: hb + dt, m: "З", ok: true, ms: ms, why: nil))
+        }
+        h.append(Sample(t: hb + 40, m: "З", ok: false, ms: 0, why: "молчит"))
+        let one = h.strip("З", from: Date(timeIntervalSince1970: Double(hb)),
+                          to: Date(timeIntervalSince1970: Double(hb + 100)), buckets: 1)[0]
+        let text = one.summary(span: "9 окт, 17:00–18:00")
+        check(text.contains("4 замера"), "число замеров названо по-русски: \(text)")
+        check(text.contains("ответов 3") && text.contains("молчания 1"),
+              "сводка перечисляет, чего и сколько было")
+        check(text.contains("180 мс") && text.contains("240 мс") && text.contains("1.5 с"),
+              "показан разброс: мин, медиана и макс — один медленный среди трёх быстрых "
+              + "не то же, что четыре медленных")
+        check(text.hasPrefix("9 окт, 17:00–18:00"), "промежуток назван первым")
+
+        // единственный замер не должен выглядеть как разброс
+        let solo = Store()
+        solo.append(Sample(t: hb + 10, m: "И", ok: true, ms: 300, why: nil))
+        let s1 = solo.strip("И", from: Date(timeIntervalSince1970: Double(hb)),
+                            to: Date(timeIntervalSince1970: Double(hb + 100)),
+                            buckets: 1)[0].summary(span: "x")
+        check(s1.contains("1 замер:") && !s1.contains("мин · медиана"),
+              "один замер показывается одним числом: \(s1)")
+
+        check(Mark.samplesWord(1) == "1 замер" && Mark.samplesWord(2) == "2 замера"
+              && Mark.samplesWord(5) == "5 замеров" && Mark.samplesWord(11) == "11 замеров"
+              && Mark.samplesWord(21) == "21 замер",
+              "склонение считает десятки: 11 замеров, а не 11 замер")
+
+        // пустая корзина честно говорит, что замеров не было
+        let empty = Mark().summary(span: "x")
+        check(empty.contains("не спрашивали"), "пустая корзина не выдумывает замеров")
+        var bridged = Mark(); bridged.health = .failed
+        check(bridged.summary(span: "x").contains("замеров не было"),
+              "дорисованный обрыв признаётся дорисованным, а не выдаёт себя за замер")
+
+        // --- промежуток не должен врать на переходе через полночь
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        let evening = cal.date(from: DateComponents(year: 2026, month: 9, day: 9,
+                                                    hour: 19, minute: 22))!
+        let crosses = Mark.span(from: evening, step: 6 * 3600, index: 0)
+        check(crosses.contains("10") && crosses.contains("01:22"),
+              "корзина через полночь называет новый день: \(crosses)")
+        let inside = Mark.span(from: evening, step: 3600, index: 0)
+        check(!inside.dropFirst(12).contains("сент"),
+              "внутри одного дня дата не повторяется дважды: \(inside)")
+
         print(failures == 0 ? "\nВсё сошлось." : "\nПровалов: \(failures)")
         exit(failures == 0 ? 0 : 1)
     }

@@ -147,24 +147,10 @@ private struct HistoryRow: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 7)
     }
-    /// Что показать при наведении на отрезок: когда это было и что тогда случилось.
     private func hint(_ index: Int, _ m: Mark) -> String {
-        let when = row.at(index)
-        let what: String
-        switch m.health {
-        case .ok: what = "ответила за " + Self.human(m.ms)
-        case .failed: what = "не ответила"
-        case .refused: what = "ответила и отказала"
-        case .offline: what = "сервера не было — связь оборвана"
-        case .listed: what = "не проверяется"
-        case .unknown: what = "не спрашивали"
-        }
-        return when.isEmpty ? what : when + " — " + what
+        m.summary(span: row.span(index))
     }
 
-    static func human(_ ms: Int) -> String {
-        ms < 1000 ? "\(ms) мс" : String(format: "%.1f с", Double(ms) / 1000)
-    }
 }
 
 enum Period: CaseIterable {
@@ -204,15 +190,11 @@ final class HistoryModel: ObservableObject {
         let uptime: String
         let uptimeColor: Color
 
-        /// Когда была корзина под этим номером.
-        func at(_ index: Int) -> String {
-            let d = from.addingTimeInterval(step * Double(index))
-            let f = DateFormatter()
-            // За сутки важен час, за месяц — день: подпись должна называть то, что
-            // человек ищет глазами, а не всё подряд.
-            f.dateFormat = step < 3600 ? "HH:mm" : (step < 86400 ? "d MMM, HH:mm" : "d MMM")
-            f.locale = Locale(identifier: "ru_RU")
-            return f.string(from: d)
+        /// Промежуток корзины считает `Mark.span`: формат живёт рядом с данными,
+        /// и его проверяет прогон. Своя копия здесь уже разошлась — на переходе
+        /// через полночь она показывала «19:22–01:22», не называя новый день.
+        func span(_ index: Int) -> String {
+            Mark.span(from: from, step: step, index: index)
         }
     }
     @Published var period: Period = .day { didSet { reload() } }

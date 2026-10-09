@@ -122,12 +122,94 @@ enum Speed: Int, CaseIterable {
 }
 
 /// Отрезок полосы истории: что было в корзине времени и насколько медленно.
+///
+/// Кроме цвета отрезок хранит и то, из чего цвет получился. Цвет отвечает на «насколько
+/// плохо», но не на «часто ли» и «насколько разбросано»: за час бывает четыре замера, и
+/// один медленный среди трёх быстрых — совсем не то же самое, что четыре медленных.
+/// Сводка нужна при наведении, и считать её потом второй раз по тем же замерам значит
+/// завести второй проход и второй повод разойтись с первым.
 struct Mark {
     var health: Health = .unknown
     /// Самый долгий успешный ответ в корзине. 0 — успешных не было.
     var ms: Int = 0
 
+    var ok = 0
+    var failed = 0
+    var refused = 0
+    var offline = 0
+    /// Время всех удачных ответов корзины — для разброса.
+    var times: [Int] = []
+
+    var total: Int { ok + failed + refused + offline }
     var speed: Speed? { health == .ok && ms > 0 ? Speed.of(ms) : nil }
+
+    /// Промежуток времени, который занимает корзина. Именно промежуток, а не момент:
+    /// сектор покрывает пятнадцать минут, час или шесть часов, и «17:30» вместо
+    /// «17:30–17:45» заставляет гадать, что в него вошло.
+    static func span(from: Date, step: TimeInterval, index: Int) -> String {
+        let a = from.addingTimeInterval(step * Double(index))
+        let b = a.addingTimeInterval(step)
+        let ru = Locale(identifier: "ru_RU")
+        let head = DateFormatter(); head.locale = ru
+        head.dateFormat = step < 86400 ? "d MMM, HH:mm" : "d MMM"
+        let tail = DateFormatter(); tail.locale = ru
+        // Корзина в шесть часов легко переваливает за полночь, и «19:22–01:22» читается
+        // как промежуток внутри одного вечера. Если день сменился, его надо назвать.
+        let sameDay = Calendar.current.isDate(a, inSameDayAs: b)
+        tail.dateFormat = step >= 86400 ? "d MMM" : (sameDay ? "HH:mm" : "d MMM, HH:mm")
+        return head.string(from: a) + " – " + tail.string(from: b)
+    }
+
+    /// Сводка по корзине для подсказки. Текст живёт здесь, а не в окне: его надо уметь
+    /// проверить прогоном, а не глазами по наведению мыши.
+    func summary(span: String) -> String {
+        var lines = [span]
+        if total == 0 {
+            // Корзина без замеров. Красной она бывает только одна — дорисованная между
+            // двумя отказами; об этом и надо сказать, а не делать вид, что замер был.
+            lines.append(health == .failed
+                         ? "замеров не было — связь молчала и до, и после"
+                         : "не спрашивали")
+            return lines.joined(separator: "\n")
+        }
+        var what: [String] = []
+        if ok > 0 { what.append("ответов \(ok)") }
+        if failed > 0 { what.append("молчания \(failed)") }
+        if refused > 0 { what.append("отказов \(refused)") }
+        if offline > 0 { what.append("без связи \(offline)") }
+        lines.append(Mark.samplesWord(total) + ": " + what.joined(separator: ", "))
+        if let s = spread {
+            lines.append(s.min == s.max
+                         ? "время ответа: " + Mark.human(s.mid)
+                         : "время ответа: \(Mark.human(s.min)) · \(Mark.human(s.mid)) · "
+                           + "\(Mark.human(s.max))  (мин · медиана · макс)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// «1 замер», «2 замера», «5 замеров» — иначе подсказка читается как машинный вывод.
+    static func samplesWord(_ n: Int) -> String {
+        let ten = n % 100
+        if ten >= 11, ten <= 14 { return "\(n) замеров" }
+        switch n % 10 {
+        case 1: return "\(n) замер"
+        case 2, 3, 4: return "\(n) замера"
+        default: return "\(n) замеров"
+        }
+    }
+
+    static func human(_ ms: Int) -> String {
+        ms < 1000 ? "\(ms) мс" : String(format: "%.1f с", Double(ms) / 1000)
+    }
+
+    /// Мин / медиана / макс по удачным ответам. Пусто — удачных не было.
+    var spread: (min: Int, mid: Int, max: Int)? {
+        guard !times.isEmpty else { return nil }
+        let v = times.sorted()
+        let mid = v.count % 2 == 1 ? v[v.count / 2]
+                                   : (v[v.count / 2 - 1] + v[v.count / 2]) / 2
+        return (v[0], mid, v[v.count - 1])
+    }
 }
 
 /// Одна точка истории. Пишется строкой JSON — файл дописывается, а не переписывается:
@@ -217,6 +299,13 @@ final class Store {
         for s in samples() where s.m == model && s.t >= a && s.t <= b {
             let i = min(buckets - 1, (s.t - a) * buckets / span)
             let h = s.health
+            switch h {
+            case .ok: out[i].ok += 1; out[i].times.append(s.ms)
+            case .failed: out[i].failed += 1
+            case .refused: out[i].refused += 1
+            case .offline: out[i].offline += 1
+            case .listed, .unknown: break
+            }
             if h == .ok {
                 // Время запоминаем всегда, даже если корзина уже красная: тогда при
                 // наведении видно и отказ, и каким был последний удачный ответ.
