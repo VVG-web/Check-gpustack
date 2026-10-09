@@ -77,6 +77,51 @@ enum Kind: String, Codable {
     }
 }
 
+/// Насколько медленно ответила модель.
+///
+/// Пороги абсолютные, а не «относительно своей нормы», и это вывод из замеров, а не
+/// упрощение. За месяц (44 680 замеров, 23 модели) медианы всех моделей уложились в
+/// узкую полосу — от 197 мс до 430 мс, разброс в 2.2 раза. Подгонять шкалу под каждую
+/// модель там нечего. Зато хвосты расходятся: при медиане 264 мс и 90-м перцентиле
+/// 526 мс максимумы доходят до 59.8 с — вплотную к таймауту. Интересное живёт в хвосте,
+/// и именно его должна показывать полоса.
+///
+/// Абсолютная шкала ещё и сходится с меню: там у модели написано «464 мс», и цвет в
+/// истории считается по тому же числу. Две шкалы для одного числа расходятся всегда.
+enum Speed: Int, CaseIterable {
+    case fast       // до 0.5 с — это 90-й перцентиль всех успешных замеров
+    case slow       // 0.5–2 с
+    case bad        // 2–10 с
+    case edge       // больше 10 с: дальше таймаут, и такие замеры уже срываются
+
+    static func of(_ ms: Int) -> Speed {
+        switch ms {
+        case ..<500: return .fast
+        case ..<2000: return .slow
+        case ..<10000: return .bad
+        default: return .edge
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .fast: return "до 0.5 с"
+        case .slow: return "0.5–2 с"
+        case .bad: return "2–10 с"
+        case .edge: return "больше 10 с"
+        }
+    }
+}
+
+/// Отрезок полосы истории: что было в корзине времени и насколько медленно.
+struct Mark {
+    var health: Health = .unknown
+    /// Самый долгий успешный ответ в корзине. 0 — успешных не было.
+    var ms: Int = 0
+
+    var speed: Speed? { health == .ok && ms > 0 ? Speed.of(ms) : nil }
+}
+
 /// Одна точка истории. Пишется строкой JSON — файл дописывается, а не переписывается:
 /// монитор работает месяцами, и перезапись всей истории на каждый опрос это лишний
 /// износ диска и окно, в котором её можно потерять целиком.
@@ -145,20 +190,58 @@ final class Store {
         return Double(rows.filter { $0.ok }.count) / Double(rows.count)
     }
 
-    /// Отрезки для полосы истории: период делится на `buckets` равных корзин, и корзина
-    /// краснеет, если в ней был хоть один отказ. Прятать единственный сбой внутри
-    /// зелёного часа нельзя — искать будут именно его.
-    func strip(_ model: String, from: Date, to: Date, buckets: Int) -> [Health] {
+    /// Отрезки для полосы истории: период делится на `buckets` равных корзин.
+    ///
+    /// В корзине побеждает худшее — и по состоянию, и по времени. Единственный сбой за
+    /// час и есть то, что ищут; спрятать его за девятью удачными замерами значит сделать
+    /// полосу бесполезной ровно там, где она нужна. По той же причине из успешных
+    /// замеров берётся самый долгий, а не средний: средний гасит всплеск.
+    func strip(_ model: String, from: Date, to: Date, buckets: Int) -> [Mark] {
         let a = Int(from.timeIntervalSince1970), b = Int(to.timeIntervalSince1970)
         let span = max(1, b - a)
-        var out = [Health](repeating: .unknown, count: buckets)
+        var out = [Mark](repeating: Mark(), count: buckets)
         for s in samples() where s.m == model && s.t >= a && s.t <= b {
             let i = min(buckets - 1, (s.t - a) * buckets / span)
-            // Худшее в корзине побеждает: единственный сбой за час и есть то, что ищут.
             let h = s.health
-            if h == .failed { out[i] = .failed }
-            else if h == .refused, out[i] != .failed { out[i] = .refused }
-            else if out[i] == .unknown { out[i] = .ok }
+            if h == .ok {
+                // Время запоминаем всегда, даже если корзина уже красная: тогда при
+                // наведении видно и отказ, и каким был последний удачный ответ.
+                out[i].ms = max(out[i].ms, s.ms)
+                if out[i].health == .unknown { out[i].health = .ok }
+            } else if h == .failed {
+                out[i].health = .failed
+            } else if h == .refused, out[i].health != .failed {
+                out[i].health = .refused
+            }
+        }
+        return bridgeOutage(out)
+    }
+
+    /// Короткий провал между двумя отказами — тоже отказ.
+    ///
+    /// Когда шлюз молчит, круг опроса растягивается: каждая модель ждёт свой таймаут, и
+    /// замеров приходит меньше, чем корзин. На живой истории обрыв поэтому рисовался
+    /// пунктиром `·✗·✗·✗` — именно там, где важнее всего увидеть сплошную полосу.
+    /// Пустота между двумя отказами объясняется самим отказом, и честнее показать её
+    /// отказом, чем дырой.
+    ///
+    /// Но только короткая. Длинный пропуск — это уже «не знаем»: закрытый ноутбук,
+    /// выключенное приложение, отпуск. Дорисовывать там час за часом значило бы выдумать
+    /// историю, которой не было.
+    private func bridgeOutage(_ marks: [Mark]) -> [Mark] {
+        var out = marks
+        let maxGap = 4                    // корзины подряд; при 96 корзинах в сутках — час
+        var i = 0
+        while i < out.count {
+            guard out[i].health == .unknown else { i += 1; continue }
+            var j = i
+            while j < out.count, out[j].health == .unknown { j += 1 }
+            let before = i > 0 ? out[i - 1].health : .unknown
+            let after = j < out.count ? out[j].health : .unknown
+            if before == .failed, after == .failed, j - i <= maxGap {
+                for k in i..<j { out[k].health = .failed }
+            }
+            i = j
         }
         return out
     }

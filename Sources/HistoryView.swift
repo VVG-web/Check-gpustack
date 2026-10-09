@@ -1,5 +1,34 @@
 import SwiftUI
 
+/// Цвета полосы. Одно место на всё окно: легенда и сами отрезки обязаны совпадать, а
+/// две таблицы цветов расходятся на первой же правке.
+///
+/// Светофор отдан СКОРОСТИ ответивших: зелёный → жёлтый → оранжевый по времени. «Нет
+/// ответа» остаётся красным, а «ответила и отказала» уехала в фиолетовый — это другая
+/// беда, не про скорость: сервер жив и отвечает за доли секунды, но отказывает по
+/// настройке, и ожиданием это не лечится. Будь она оранжевой, её нельзя было бы отличить
+/// от модели на грани таймаута.
+enum Palette {
+    static func of(_ m: Mark) -> Color {
+        switch m.health {
+        case .ok: return speed(Speed.of(max(m.ms, 1)))
+        case .failed: return .red
+        case .refused: return Color(red: 0.69, green: 0.32, blue: 0.87)
+        case .listed: return .blue.opacity(0.35)
+        case .unknown: return Color.secondary.opacity(0.18)
+        }
+    }
+
+    static func speed(_ s: Speed) -> Color {
+        switch s {
+        case .fast: return Color(red: 0.20, green: 0.78, blue: 0.35)
+        case .slow: return Color(red: 0.60, green: 0.80, blue: 0.20)
+        case .bad: return Color(red: 1.00, green: 0.84, blue: 0.04)
+        case .edge: return Color(red: 1.00, green: 0.58, blue: 0.00)
+        }
+    }
+}
+
 /// Окно истории: полоса состояний по каждой модели и доступность за период.
 ///
 /// Одно текущее «доступна/нет» отвечает на вопрос «работает сейчас», но не на тот, ради
@@ -47,13 +76,21 @@ struct HistoryView: View {
             }
             Divider()
             HStack(spacing: 14) {
-                Legend(color: .green, text: "отвечала")
+                HStack(spacing: 5) {
+                    Text("ответила:").font(.system(size: 10)).foregroundStyle(.secondary)
+                    ForEach(Speed.allCases, id: \.self) { s in
+                        HStack(spacing: 3) {
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(Palette.speed(s)).frame(width: 10, height: 10)
+                            Text(s.title).font(.system(size: 10)).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Divider().frame(height: 12)
                 Legend(color: .red, text: "не ответила")
-                Legend(color: .orange, text: "отвечала и отказала")
+                Legend(color: Color(red: 0.69, green: 0.32, blue: 0.87), text: "отказала")
                 Legend(color: Color.secondary.opacity(0.22), text: "не спрашивали")
                 Spacer()
-                Text("Картинки, речь и OCR настоящим запросом не проверяются: это стоило бы генерации")
-                    .foregroundStyle(.secondary).font(.system(size: 10))
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
@@ -87,8 +124,12 @@ private struct HistoryRow: View {
                 let n = max(row.strip.count, 1)
                 let w = geo.size.width / CGFloat(n)
                 HStack(spacing: 0.5) {
-                    ForEach(Array(row.strip.enumerated()), id: \.offset) { _, h in
-                        Rectangle().fill(color(h)).frame(width: max(1, w - 0.5))
+                    ForEach(Array(row.strip.enumerated()), id: \.offset) { i, m in
+                        Rectangle().fill(Palette.of(m)).frame(width: max(1, w - 0.5))
+                            // Цвет говорит «насколько», подсказка — «сколько именно».
+                            // Без точного числа у человека нет способа отличить 2.1 с
+                            // от 9.9 с, а это разные новости.
+                            .help(hint(i, m))
                     }
                 }
                 .frame(height: 22)
@@ -102,14 +143,22 @@ private struct HistoryRow: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 7)
     }
-    private func color(_ h: Health) -> Color {
-        switch h {
-        case .ok: return .green
-        case .failed: return .red
-        case .refused: return .orange
-        case .listed: return .blue.opacity(0.35)
-        case .unknown: return Color.secondary.opacity(0.18)
+    /// Что показать при наведении на отрезок: когда это было и что тогда случилось.
+    private func hint(_ index: Int, _ m: Mark) -> String {
+        let when = row.at(index)
+        let what: String
+        switch m.health {
+        case .ok: what = "ответила за " + Self.human(m.ms)
+        case .failed: what = "не ответила"
+        case .refused: what = "ответила и отказала"
+        case .listed: what = "не проверяется"
+        case .unknown: what = "не спрашивали"
         }
+        return when.isEmpty ? what : when + " — " + what
+    }
+
+    static func human(_ ms: Int) -> String {
+        ms < 1000 ? "\(ms) мс" : String(format: "%.1f с", Double(ms) / 1000)
     }
 }
 
@@ -143,9 +192,23 @@ final class HistoryModel: ObservableObject {
         let id: String
         let name: String
         let kind: String
-        let strip: [Health]
+        let strip: [Mark]
+        /// Начало периода и ширина корзины: подсказке нужно сказать, когда это было.
+        let from: Date
+        let step: TimeInterval
         let uptime: String
         let uptimeColor: Color
+
+        /// Когда была корзина под этим номером.
+        func at(_ index: Int) -> String {
+            let d = from.addingTimeInterval(step * Double(index))
+            let f = DateFormatter()
+            // За сутки важен час, за месяц — день: подпись должна называть то, что
+            // человек ищет глазами, а не всё подряд.
+            f.dateFormat = step < 3600 ? "HH:mm" : (step < 86400 ? "d MMM, HH:mm" : "d MMM")
+            f.locale = Locale(identifier: "ru_RU")
+            return f.string(from: d)
+        }
     }
     @Published var period: Period = .day { didSet { reload() } }
     @Published var rows: [Row] = []
@@ -174,7 +237,9 @@ final class HistoryModel: ObservableObject {
             default: color = .red
             }
             out.append(Row(id: name, name: name, kind: s.kind.title,
-                           strip: strip, uptime: text, uptimeColor: color))
+                           strip: strip, from: from,
+                           step: period.seconds / Double(period.buckets),
+                           uptime: text, uptimeColor: color))
         }
         rows = out
         // Про спрятанное говорим вслух: пустая строка в отчёте без объяснения выглядит
