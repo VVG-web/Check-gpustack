@@ -11,9 +11,37 @@ struct SettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Form {
-                Section("Шлюз") {
-                    TextField("Адрес /v1", text: $model.url)
-                    SecureField("Ключ", text: $model.key)
+                Section("Шлюзы") {
+                    ForEach($model.backends) { $b in
+                        HStack(spacing: 6) {
+                            TextField("имя", text: $b.name)
+                                .frame(width: 110)
+                                .help("Входит в имя модели: «\(b.name)/qwen». По нему же "
+                                      + "различаются одинаково названные модели разных "
+                                      + "шлюзов")
+                            TextField("адрес /v1", text: $b.url)
+                            SecureField("ключ", text: $b.key).frame(width: 120)
+                            Button {
+                                model.remove(b.id)
+                            } label: { Image(systemName: "minus.circle") }
+                                .buttonStyle(.borderless)
+                                .help("Убрать шлюз. История его моделей останется на диске")
+                        }
+                    }
+                    HStack {
+                        Button {
+                            model.add()
+                        } label: { Label("Добавить шлюз", systemImage: "plus") }
+                        Spacer()
+                        if !model.warning.isEmpty {
+                            Text(model.warning).font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    Text("Модели зовутся «шлюз/модель»: на разных контурах они называются "
+                         + "одинаково, а доступность у них разная. Переименуете шлюз — "
+                         + "история переедет вместе с ним.")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 Section("Как часто спрашивать") {
                     HStack {
@@ -34,7 +62,7 @@ struct SettingsView: View {
                 }
             }
             .formStyle(.grouped)
-            .frame(height: 250)
+            .frame(minHeight: 240)
 
             Divider()
             HStack {
@@ -83,7 +111,7 @@ struct SettingsView: View {
                         }
                     }
                 }
-                .frame(minHeight: 90, maxHeight: 190)
+                .frame(minHeight: 90)
             }
 
             Divider()
@@ -94,7 +122,7 @@ struct SettingsView: View {
             }
             .padding(12)
         }
-        .frame(width: 520)
+        .frame(minWidth: 560, minHeight: 420)
     }
 }
 
@@ -103,12 +131,14 @@ struct SettingsView: View {
 final class SettingsModel: ObservableObject {
     struct Row { let name: String }
 
-    @Published var url: String { didSet { push() } }
-    @Published var key: String { didSet { push() } }
+    /// Шлюзы правятся прямо в списке. Запись идёт по каждому изменению — кнопки
+    /// «Сохранить» нет нарочно: лишняя кнопка это лишний повод забыть её нажать.
+    @Published var backends: [Backend] { didSet { pushBackends(oldValue) } }
     @Published var rosterSeconds: Int { didSet { push() } }
     @Published var probeSeconds: Int { didSet { push() } }
     @Published var hidden: [Row] = []
     @Published var note = ""
+    @Published var warning = ""
     var close: (() -> Void)?
 
     private let monitor: Monitor
@@ -118,9 +148,23 @@ final class SettingsModel: ObservableObject {
         self.monitor = monitor
         self.onChange = onChange
         let c = monitor.config
-        url = c.url; key = c.key
-        rosterSeconds = c.rosterSeconds; probeSeconds = c.probeSeconds
+        backends = c.backends
+        rosterSeconds = c.rosterSeconds
+        probeSeconds = c.probeSeconds
         reload()
+    }
+
+    func add() {
+        // Имя предлагаем сами: пустое имя сделало бы модели безымянными, а два пустых —
+        // неразличимыми.
+        var n = 1
+        var name = "шлюз"
+        while backends.contains(where: { $0.name == name }) { n += 1; name = "шлюз\(n)" }
+        backends.append(Backend(name: name, url: "", key: ""))
+    }
+
+    func remove(_ id: String) {
+        backends.removeAll { $0.id == id }
     }
 
     func reload() {
@@ -154,10 +198,38 @@ final class SettingsModel: ObservableObject {
         onChange()
     }
 
+    /// Шлюзы изменились. Переименование надо поймать здесь: имя входит в имя каждой
+    /// модели, а значит и в историю — её нужно перенести, иначе прошлое осиротеет.
+    private func pushBackends(_ old: [Backend]) {
+        var seen = Set<String>()
+        var problems: [String] = []
+        for b in backends {
+            let name = b.name.trimmingCharacters(in: .whitespaces)
+            if name.isEmpty { problems.append("шлюз без имени") }
+            else if !seen.insert(name).inserted { problems.append("имя «\(name)» повторяется") }
+            if name.contains("/") { problems.append("в имени «\(name)» нельзя косую черту") }
+        }
+        warning = problems.isEmpty ? "" : problems.joined(separator: " · ")
+        guard problems.isEmpty else { return }   // кривое имя в настройку не пишем
+
+        // Переименование: тот же шлюз на том же месте, но под новым именем.
+        for (i, b) in backends.enumerated() where i < old.count {
+            if old[i].name != b.name, old[i].url == b.url {
+                Migration.rename(from: old[i].name, to: b.name)
+            }
+        }
+        var c = monitor.config
+        c.backends = backends.map {
+            Backend(name: $0.name.trimmingCharacters(in: .whitespaces),
+                    url: $0.url.trimmingCharacters(in: .whitespaces), key: $0.key)
+        }
+        monitor.apply(c)
+        reload()
+        onChange()
+    }
+
     private func push() {
         var c = monitor.config
-        c.url = url.trimmingCharacters(in: .whitespaces)
-        c.key = key
         c.rosterSeconds = max(15, rosterSeconds)
         c.probeSeconds = max(60, probeSeconds)
         monitor.apply(c)

@@ -36,8 +36,10 @@ struct Check {
         // приложения молча уносит ключ и адрес шлюза.
         let old = #"{"url":"http://шлюз/v1","key":"секрет","rosterSeconds":60,"probeSeconds":900,"historyDays":90}"#
         let decoded = try? JSONDecoder().decode(Config.self, from: Data(old.utf8))
-        check(decoded?.key == "секрет" && decoded?.url == "http://шлюз/v1",
-              "настройка без поля hidden читается, ключ и адрес целы")
+        check(decoded?.backends.first?.key == "секрет"
+              && decoded?.backends.first?.url == "http://шлюз/v1"
+              && decoded?.backends.first?.name == Config.legacyName,
+              "настройка без поля hidden читается, ключ и адрес целы, шлюз стал gpustack")
         check(decoded?.hidden.isEmpty == true,
               "у старой настройки список скрытых пуст, а не сломан")
 

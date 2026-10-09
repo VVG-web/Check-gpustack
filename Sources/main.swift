@@ -44,6 +44,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(
             self, selector: #selector(showFromOtherLaunch),
             name: Self.showRequest, object: nil)
+        // Перенос старых имён на «шлюз/модель» — до того, как кто-либо прочтёт данные.
+        Migration.run()
         monitor = Monitor(config: Config.load())
         monitor.onChange = { [weak self] in self?.redraw() }
 
@@ -72,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Свежая установка без адреса — человеку нужны настройки, а не пустая история:
         // показывать таблицу без единой строки и молчать о причине значит отправить его
         // искать, что он сделал не так.
-        if monitor.config.url.trimmingCharacters(in: .whitespaces).isEmpty {
+        if !monitor.config.ready {
             openSettings()
             Log.say("первый запуск без адреса — открыл настройки")
         } else {
@@ -101,20 +103,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // сколько моделей отвечает из тех, что вообще проверяются. Полное «24» здесь
         // соврало бы — часть моделей мы не спрашиваем принципиально.
         guard let button = item.button else { return }
-        if monitor.config.url.trimmingCharacters(in: .whitespaces).isEmpty {
-            button.title = "GPUStack — не настроен"
-            button.toolTip = "Укажите адрес шлюза: значок → «Настройки…»"
-            return
-        }
-        if !monitor.gatewayOK {
-            button.title = "GPUStack ✗"
-            button.toolTip = "Шлюз не отвечает: " + monitor.gatewayWhy
-            return
-        }
-        let ok = monitor.answering, all = monitor.testable
-        button.title = all == 0 ? "GPUStack …"
-            : (ok == all ? "\(ok)/\(all)" : "⚠ \(ok)/\(all)")
-        button.toolTip = "Отвечают \(ok) из \(all) проверяемых моделей GPUStack"
+        button.title = monitor.badge
+        button.toolTip = monitor.config.backends.isEmpty
+            ? "Укажите адрес шлюза: значок → «Настройки…»"
+            : monitor.config.backends.map { b in
+                let g = monitor.gateways[b.name]
+                return "\(b.name): " + (g?.ok == true ? "отвечает" : (g?.why ?? "ещё не спрашивали"))
+            }.joined(separator: "\n")
         showOnFirstEverLaunch()
         // Меню здесь НЕ пересобирается. Оно строится в `menuWillOpen`, то есть ровно
         // тогда, когда на него смотрят. Перестраивать его каждую минуту — это работа на
@@ -124,10 +119,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func build(_ menu: NSMenu) {
         menu.removeAllItems()
-        let host = URL(string: monitor.config.url)?.host ?? monitor.config.url
-        head(menu, monitor.gatewayOK
-            ? "\(host) · GPUStack \(monitor.version.isEmpty ? "" : monitor.version)"
-            : "\(host) — не отвечает: \(monitor.gatewayWhy)")
+        if monitor.config.backends.isEmpty {
+            head(menu, "Шлюзы не заданы — откройте «Настройки…»")
+        }
+        for b in monitor.config.backends {
+            let g = monitor.gateways[b.name]
+            let host = URL(string: b.url)?.host ?? b.url
+            head(menu, g?.ok == true
+                ? "\(b.name) · \(host)"
+                    + ((g?.version.isEmpty ?? true) ? "" : " · GPUStack \(g!.version)")
+                : "\(b.name) · \(host) — не отвечает: \(g?.why ?? "ещё не спрашивали")")
+        }
         head(menu, times())
         menu.addItem(.separator())
 
@@ -139,13 +141,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for s in broken { menu.addItem(row(s)) }
             menu.addItem(.separator())
         }
-        for kind in [Kind.chat, .embedding, .rerank, .untested, .unknown] {
-            let list = monitor.order.compactMap { monitor.models[$0] }
-                .filter { $0.kind == kind && $0.health != .failed && $0.health != .refused
-                          && !monitor.config.hiddenFromMenu($0.name) }
-            guard !list.isEmpty else { continue }
-            head(menu, kind.title)
-            for s in list { menu.addItem(row(s)) }
+        // Группируем по шлюзу, а внутри — по виду. Пока шлюз один, заголовок с его
+        // именем не мешает; когда их несколько, без него список не прочесть: модели на
+        // разных контурах называются одинаково.
+        let many = monitor.config.backends.count > 1
+        for b in monitor.config.backends {
+            let mine = monitor.order.filter { Backend.split($0).backend == b.name }
+            guard !mine.isEmpty else { continue }
+            if many { head(menu, "Шлюз \(b.name)") }
+            for kind in [Kind.chat, .embedding, .rerank, .untested, .unknown] {
+                let list = mine.compactMap { monitor.models[$0] }
+                    .filter { $0.kind == kind && $0.health != .failed
+                              && $0.health != .refused
+                              && !monitor.config.hiddenFromMenu($0.name) }
+                guard !list.isEmpty else { continue }
+                head(menu, many ? "  " + kind.title : kind.title)
+                for s in list { menu.addItem(row(s)) }
+            }
         }
         let hiddenCount = monitor.config.hidden.count
         if hiddenCount > 0 {
@@ -195,7 +207,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         var tail = ""
         if s.health == .ok { tail = "  \(s.ms) мс" }
-        let it = NSMenuItem(title: "\(mark) \(s.name)\(tail)", action: nil, keyEquivalent: "")
+        // Имя шлюза уже стоит заголовком группы — в каждой строке оно лишнее.
+        let it = NSMenuItem(title: "\(mark) \(Backend.split(s.name).model)\(tail)",
+                            action: nil, keyEquivalent: "")
         it.toolTip = s.why.isEmpty
             ? (s.health == .ok ? "Ответила за \(s.ms) мс" : nil) : s.why
         // Скрытие живёт в подменю, а не на самой строке. Строка — это состояние модели,
@@ -278,9 +292,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.historyModel?.reload()
         })
         settingsModel = m
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 620),
+                         styleMask: [.titled, .closable, .resizable],
+                         backing: .buffered, defer: false)
         w.title = "Настройки монитора"
+        w.minSize = NSSize(width: 560, height: 420)
         w.contentViewController = NSHostingController(rootView: SettingsView(model: m))
         w.center(); w.isReleasedWhenClosed = false
         m.close = { [weak w] in w?.close() }

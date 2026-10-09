@@ -252,11 +252,19 @@ final class Store {
     private var cache: [Sample] = []
     private var loaded = false
 
+    /// Имена моделей теперь содержат косую черту (`шлюз/модель`), а JSONEncoder по
+    /// умолчанию пишет её как `\/`. Историю читают глазами и grep'ом — пусть читается.
+    static let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.withoutEscapingSlashes]
+        return e
+    }()
+
     func append(_ s: Sample) {
         queue.sync {
             loadLocked()
             cache.append(s)
-            guard let line = try? JSONEncoder().encode(s) else { return }
+            guard let line = try? Store.encoder.encode(s) else { return }
             var data = line
             data.append(0x0A)
             if let h = try? FileHandle(forWritingTo: file) {
@@ -365,7 +373,7 @@ final class Store {
             let kept = cache.filter { $0.t >= edge }
             guard kept.count != cache.count else { return }
             cache = kept
-            let enc = JSONEncoder()
+            let enc = Store.encoder
             let body = kept.compactMap { try? enc.encode($0) }
                 .map { String(data: $0, encoding: .utf8) ?? "" }
                 .joined(separator: "\n")

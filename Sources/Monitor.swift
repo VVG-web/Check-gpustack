@@ -10,9 +10,13 @@ final class Monitor {
     let store = Store()
     private(set) var models: [String: ModelState] = [:]
     private(set) var order: [String] = []
-    private(set) var gatewayOK = false
-    private(set) var gatewayWhy = ""
-    private(set) var version = ""
+    /// Состояние каждого шлюза отдельно: имя → отвечает ли, почему нет, какая версия.
+    ///
+    /// Общего «шлюз доступен» больше нет, и это не усложнение ради общности. Контуры
+    /// живут порознь: корпоративный уходит вместе с VPN, домашний — вместе с розеткой.
+    /// Одно общее состояние на всех означало бы, что падение одного красит модели
+    /// другого.
+    private(set) var gateways: [String: GatewayState] = [:]
     private(set) var lastRoster: Date?
     private(set) var lastProbe: Date?
     /// Найденный вид модели переживает перезапуск: искать его заново значит слать на
@@ -53,6 +57,12 @@ final class Monitor {
     /// Спрашивали ли модели хоть раз с запуска.
     private(set) var probedOnce = false
 
+    struct GatewayState {
+        var ok = false
+        var why = ""
+        var version = ""
+    }
+
     var onChange: (() -> Void)?
 
     init(config: Config) {
@@ -63,7 +73,8 @@ final class Monitor {
            let w = try? JSONDecoder().decode([String: String].self, from: d) { untestedWhy = w }
         store.prune(days: config.historyDays)
         Log.trim()
-        Log.say("запуск · адрес \(config.url) · ключ \(config.key.isEmpty ? "не задан" : "есть")")
+        Log.say("запуск · шлюзов: \(config.backends.count)"
+                + config.backends.map { " · \($0.name) \($0.url)" }.joined())
     }
 
     func apply(_ c: Config) {
@@ -179,87 +190,115 @@ final class Monitor {
 
     // ------------------------------------------------------- список моделей
 
-    /// Кто числится на шлюзе. Дёшево: обычный GET, генерации нет.
+    /// Кто числится на шлюзах. Дёшево: обычный GET, генерации нет.
     ///
-    /// Вызывается с главного потока: снимок настройки берётся здесь, запрос уходит в
+    /// Вызывается с главного потока: снимок настройки берётся здесь, запросы уходят в
     /// `io`, результат возвращается сюда же.
     func refreshRoster() {
         dispatchPrecondition(condition: .onQueue(.main))
-        let cfg = config
-        // Свежая установка: адреса ещё нет. Молчать нельзя — иначе значок покажет «✗»,
-        // и человек пойдёт искать обрыв связи вместо пустого поля в настройках.
-        guard !cfg.url.trimmingCharacters(in: .whitespaces).isEmpty else {
-            gatewayOK = false
-            gatewayWhy = "шлюз не указан — впишите адрес в «Настройках…»"
+        let list = config.backends.filter {
+            !$0.url.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        // Свежая установка: шлюзов ещё нет. Молчать нельзя — иначе значок покажет «✗»,
+        // и человек пойдёт искать обрыв связи вместо пустого списка в настройках.
+        guard !list.isEmpty else {
+            gateways = [:]
+            models.removeAll()
+            order.removeAll()
             onChange?()
             return
         }
-        let needVersion = version.isEmpty
+        let needVersion = Set(list.filter { gateways[$0.name]?.version.isEmpty ?? true }
+                                  .map(\.name))
         io.async { [weak self] in
-            let (st, data, err, _) = Self.request(url: cfg.url + "/models", key: cfg.key,
-                                                  body: nil, timeout: 15)
-            let ver = (st == 200 && needVersion)
-                ? Self.fetchVersion(url: cfg.url, key: cfg.key) : nil
-            DispatchQueue.main.async {
-                self?.applyRoster(status: st, data: data, error: err, version: ver, cfg: cfg)
+            var answers: [(Backend, Int?, Data?, String, String?)] = []
+            for b in list {
+                let (st, data, err, _) = Self.request(url: b.url + "/models", key: b.key,
+                                                      body: nil, timeout: 15)
+                let ver = (st == 200 && needVersion.contains(b.name))
+                    ? Self.fetchVersion(url: b.url, key: b.key) : nil
+                answers.append((b, st, data, err, ver))
             }
+            DispatchQueue.main.async { self?.applyRoster(answers) }
         }
     }
 
-    private func applyRoster(status st: Int?, data: Data?, error err: String,
-                             version ver: String?, cfg: Config) {
+    private func applyRoster(_ answers: [(Backend, Int?, Data?, String, String?)]) {
         dispatchPrecondition(condition: .onQueue(.main))
-        if let ver { version = ver }
-        if st != 200 {
-            Log.say("список моделей не получен: " + (st == nil ? err : "HTTP \(st!)"))
-            gatewayOK = false
-            gatewayWhy = st == nil ? err : "HTTP \(st!)"
-            // У молчания внутреннего адреса две частые причины, и обе не очевидны.
-            // Называем обе, а не одну: при отладке этого монитора я уверенно объявил
-            // виновным разрешение macOS, а на деле пропал маршрут в корпоративную сеть —
-            // обычный сокет из терминала молчал точно так же.
-            if st == nil, Self.isPrivate(host: cfg.url) {
-                gatewayWhy += " · адрес внутренний: проверьте, есть ли сеть до него "
-                    + "(VPN), и разрешён ли приложению доступ к локальной сети "
-                    + "(Системные настройки → Конфиденциальность)"
-            }
-            // Шлюз молчит — значит, ни одна модель сейчас не доступна, и показывать
-            // прошлые зелёные галочки нельзя: они соврут ровно тогда, когда важны.
-            // Шлюз молчит — значит мы сейчас не знаем о моделях ничего. Красить их
-            // отказом нельзя: это чужая беда, и в их доступности её быть не должно.
-            for name in order { models[name]?.health = .offline; models[name]?.why = gatewayWhy }
-            onChange?()
-            return
-        }
-        gatewayOK = true
-        gatewayWhy = ""
-        guard let data,
-              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let list = j["data"] as? [[String: Any]] else { onChange?(); return }
+        var fresh: Set<String> = []
+        var live: [String: GatewayState] = [:]
 
-        var fresh: [String] = []
-        for item in list {
-            guard let id = item["id"] as? String else { continue }
-            fresh.append(id)
-            if models[id] == nil {
-                var s = ModelState(name: id)
-                s.kind = kinds[id] ?? .unknown
-                s.seen = (item["created"] as? Int).map { Date(timeIntervalSince1970: Double($0)) }
-                models[id] = s
+        for (b, st, data, err, ver) in answers {
+            var state = gateways[b.name] ?? GatewayState()
+            if let ver { state.version = ver }
+
+            if st != 200 {
+                Log.say("\(b.name): список моделей не получен: "
+                        + (st == nil ? err : "HTTP \(st!)"))
+                state.ok = false
+                state.why = st == nil ? err : "HTTP \(st!)"
+                // У молчания внутреннего адреса две частые причины, и обе не очевидны.
+                // Называем обе: при отладке я уверенно объявил виновным разрешение
+                // macOS, а на деле пропал маршрут в корпоративную сеть — обычный сокет
+                // из терминала молчал точно так же.
+                if st == nil, Self.isPrivate(host: b.url) {
+                    state.why += " · адрес внутренний: проверьте, есть ли сеть до него "
+                        + "(VPN), и разрешён ли приложению доступ к локальной сети "
+                        + "(Системные настройки → Конфиденциальность)"
+                }
+                live[b.name] = state
+                // Шлюз молчит — о его моделях мы сейчас не знаем ничего. Красить их
+                // отказом нельзя: это чужая беда, и в их доступности её быть не должно.
+                // Из перечня они при этом не исчезают: шлюз вернётся, и история не
+                // должна прерываться дырой в именах.
+                for name in order where Backend.split(name).backend == b.name {
+                    models[name]?.health = .offline
+                    models[name]?.why = state.why
+                    fresh.insert(name)
+                }
+                continue
+            }
+
+            state.ok = true
+            state.why = ""
+            live[b.name] = state
+            guard let data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let items = j["data"] as? [[String: Any]] else { continue }
+            for item in items {
+                guard let id = item["id"] as? String else { continue }
+                let full = b.qualify(id)
+                fresh.insert(full)
+                if models[full] == nil {
+                    var s = ModelState(name: full)
+                    s.kind = kinds[full] ?? .unknown
+                    s.seen = (item["created"] as? Int)
+                        .map { Date(timeIntervalSince1970: Double($0)) }
+                    models[full] = s
+                }
             }
         }
-        // Модель, пропавшая из списка, не «стала недоступной» — её сняли со шлюза.
-        // Держать её в перечне значит копить мусор и пугать красным тем, чего уже нет.
+
+        gateways = live
+        // Модель, пропавшая из списка живого шлюза, не «стала недоступной» — её сняли.
+        // Держать её значит копить мусор и пугать красным тем, чего уже нет. Модели
+        // молчащего шлюза остаются: про них мы просто ничего не знаем.
         for gone in order where !fresh.contains(gone) { models.removeValue(forKey: gone) }
-        order = fresh.sorted { $0.lowercased() < $1.lowercased() }
+        for name in models.keys where !fresh.contains(name) {
+            models.removeValue(forKey: name)
+        }
+        order = models.keys.sorted {
+            let a = Backend.split($0), b = Backend.split($1)
+            return a.backend == b.backend
+                ? a.model.lowercased() < b.model.lowercased()
+                : a.backend.lowercased() < b.backend.lowercased()
+        }
         let first = lastRoster == nil
-        if first { Log.say("список моделей: \(order.count)") }
+        if first { Log.say("список моделей: \(order.count) на \(answers.count) шлюзах") }
         lastRoster = Date()
         onChange?()
-        // Первый настоящий опрос идёт сразу за первым списком, а не по расписанию.
-        // Раньше он звался следом за `refreshRoster()`, но список теперь приходит из
-        // сети асинхронно — и опрос уходил в пустоту, а результатов пришлось бы ждать
-        // пятнадцать минут.
+        // Первый настоящий опрос идёт сразу за первым списком, а не по расписанию:
+        // список приходит из сети асинхронно, и опрос уходил бы в пустоту.
         if first, !order.isEmpty, !probedOnce { probeAll() }
     }
 
@@ -281,8 +320,8 @@ final class Monitor {
     /// Спрашиваем только тогда, когда модель уже молчит: надо понять, чья это беда.
     /// Молчат разом все — значит упала связь (VPN, сеть, выключенный шлюз), и вины
     /// модели в этом нет. Отвечает шлюз, а модель нет — вот это её отказ.
-    private static func gatewayAlive(_ cfg: Config) -> Bool {
-        request(url: cfg.url + "/models", key: cfg.key, body: nil, timeout: 10).status == 200
+    private static func gatewayAlive(_ b: Backend) -> Bool {
+        request(url: b.url + "/models", key: b.key, body: nil, timeout: 10).status == 200
     }
 
     /// Спросить каждую модель по-настоящему. Идёт долго и нагружает кластер — поэтому
@@ -310,39 +349,45 @@ final class Monitor {
             Log.say("пересматриваю «не проверяется» у \(name)"
                     + (rediscover ? " — по кнопке" : " — отметке больше суток"))
         }
-        let cfg = config
-        let plan: [(String, Kind)] = order.compactMap {
-            guard let s = models[$0] else { return nil }
-            return ($0, s.kind)
+        // План по шлюзам: обрыв связи обрывает остаток СВОЕГО шлюза, а не всех сразу.
+        var plan: [String: [(String, Kind)]] = [:]
+        for full in order {
+            guard let s = models[full] else { continue }
+            plan[Backend.split(full).backend, default: []].append((full, s.kind))
         }
+        let backends = config.backends
         io.async { [weak self] in
-            for (index, (name, kind)) in plan.enumerated() {
-                guard let self else { return }
-                let outcome = Self.probeOne(name: name, kind: kind, cfg: cfg,
-                                            discoverTimeout: self.discoverTimeout,
-                                            probeTimeout: self.probeTimeout,
-                                            store: self.store,
-                                            knownReason: nil)
-                DispatchQueue.main.async { self.applyProbe(name: name, outcome: outcome) }
-                guard outcome.offline else { continue }
-                // Связи нет — остальных не спрашиваем. Каждый из них всё равно дождётся
-                // своего таймаута, и круг растянется на четверть часа пустого ожидания:
-                // на живой истории обрыв поэтому и шёл редкими отметками. Остаток круга
-                // отмечаем тем же «связи не было» — это про сеть, а не про модели.
-                Log.say("нет связи со шлюзом — остаток круга пропускаю "
-                        + "(\(plan.count - index - 1) моделей)")
-                let rest = plan.dropFirst(index + 1)
-                let now = Int(Date().timeIntervalSince1970)
-                for (other, otherKind) in rest where otherKind != .untested {
-                    self.store.append(Sample(t: now, m: other, ok: false, ms: 0,
-                                             why: "нет связи с сервером",
-                                             st: Health.offline.rawValue))
-                    let o = Outcome(kind: otherKind, health: .offline, ms: 0,
-                                    why: "сервера не было — связь оборвана",
-                                    untestedReason: nil, offline: true)
-                    DispatchQueue.main.async { self.applyProbe(name: other, outcome: o) }
+            for b in backends {
+                guard let self, let mine = plan[b.name] else { continue }
+                var broke = false
+                for (index, (full, kind)) in mine.enumerated() {
+                    let outcome = Self.probeOne(name: full, kind: kind, backend: b,
+                                                discoverTimeout: self.discoverTimeout,
+                                                probeTimeout: self.probeTimeout,
+                                                store: self.store)
+                    DispatchQueue.main.async { self.applyProbe(name: full, outcome: outcome) }
+                    guard outcome.offline else { continue }
+                    // Связи нет — остальных на ЭТОМ шлюзе не спрашиваем. Каждый из них
+                    // всё равно дождётся своего таймаута, и круг растянется на четверть
+                    // часа пустого ожидания. Остаток отмечаем тем же «связи не было» —
+                    // это про сеть, а не про модели.
+                    Log.say("\(b.name): нет связи — остаток круга пропускаю "
+                            + "(\(mine.count - index - 1) моделей)")
+                    let stamp = Int(Date().timeIntervalSince1970)
+                    for (other, otherKind) in mine.dropFirst(index + 1)
+                    where otherKind != .untested {
+                        self.store.append(Sample(t: stamp, m: other, ok: false, ms: 0,
+                                                 why: "нет связи с сервером",
+                                                 st: Health.offline.rawValue))
+                        let o = Outcome(kind: otherKind, health: .offline, ms: 0,
+                                        why: "сервера не было — связь оборвана",
+                                        untestedReason: nil, offline: true)
+                        DispatchQueue.main.async { self.applyProbe(name: other, outcome: o) }
+                    }
+                    broke = true
+                    break
                 }
-                break
+                _ = broke
             }
             DispatchQueue.main.async { self?.finishProbe() }
         }
@@ -386,12 +431,14 @@ final class Monitor {
         dispatchPrecondition(condition: .onQueue(.main))
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         var L: [String] = ["# Что показывает монитор — \(f.string(from: Date()))", ""]
-        let ok = answering, all = testable
-        L.append("Значок: " + (gatewayOK ? (ok == all ? "\(ok)/\(all)" : "⚠ \(ok)/\(all)")
-                                         : "GPUStack ✗"))
-        L.append("Шлюз: \(config.url)" + (version.isEmpty ? "" : " · GPUStack \(version)")
-                 + (gatewayOK ? "" : " · \(gatewayWhy)"))
-        L.append("Моделей на шлюзе: \(order.count) · проверяем \(all) · скрыто "
+        L.append("Значок: " + badge)
+        for b in config.backends {
+            let g = gateways[b.name] ?? GatewayState()
+            L.append("Шлюз \(b.name): \(b.url)"
+                     + (g.version.isEmpty ? "" : " · GPUStack \(g.version)")
+                     + (g.ok ? "" : " · НЕ ОТВЕЧАЕТ: \(g.why)"))
+        }
+        L.append("Моделей: \(order.count) · проверяем \(testable) · скрыто "
                  + "\(config.hidden.count)")
         L.append("")
 
@@ -401,13 +448,18 @@ final class Monitor {
             L.append("### Требуют внимания")
             for s in broken { L.append(menuLine(s)) }
         }
-        for kind in [Kind.chat, .embedding, .rerank, .untested, .unknown] {
-            let list = order.compactMap { models[$0] }
-                .filter { $0.kind == kind && $0.health != .failed && $0.health != .refused
-                          && !config.hiddenFromMenu($0.name) }
-            guard !list.isEmpty else { continue }
-            L.append("### \(kind.title)")
-            for s in list { L.append(menuLine(s)) }
+        for b in config.backends {
+            let mine = order.filter { Backend.split($0).backend == b.name }
+            guard !mine.isEmpty else { continue }
+            L.append("### Шлюз \(b.name)")
+            for kind in [Kind.chat, .embedding, .rerank, .untested, .unknown] {
+                let list = mine.compactMap { models[$0] }
+                    .filter { $0.kind == kind && $0.health != .failed && $0.health != .refused
+                              && !config.hiddenFromMenu($0.name) }
+                guard !list.isEmpty else { continue }
+                L.append("#### \(kind.title)")
+                for s in list { L.append(menuLine(s)) }
+            }
         }
         let hiddenMenu = order.filter { config.hiddenFromMenu($0) }
         if !hiddenMenu.isEmpty {
@@ -417,14 +469,16 @@ final class Monitor {
 
         L.append("")
         L.append("## Окно истории (за сутки)")
-        L.append("| модель | вид | состояние | доступность |")
-        L.append("|---|---|---|---|")
+        L.append("| модель | шлюз | вид | состояние | доступность |")
+        L.append("|---|---|---|---|---|")
         let since = Date().addingTimeInterval(-86400)
         for name in order where !config.hiddenFromHistory(name) {
             guard let s = models[name] else { continue }
             let up = store.uptime(name, since: since)
             let text = up.map { String(format: "%.1f %%", $0 * 100) } ?? "нет замеров"
-            L.append("| \(name) | \(s.kind.title) | \(word(s.health)) | \(text) |")
+            let parts = Backend.split(name)
+            L.append("| \(parts.model) | \(parts.backend) | \(s.kind.title) | "
+                     + "\(word(s.health)) | \(text) |")
         }
         let hiddenHist = order.filter { config.hiddenFromHistory($0) }
         if !hiddenHist.isEmpty {
@@ -447,7 +501,9 @@ final class Monitor {
         case .listed: mark = "•"
         case .unknown: mark = "…"
         }
-        return "  \(mark) \(s.name)" + (s.health == .ok ? "  \(s.ms) мс" : "")
+        // Как в меню: шлюз уже назван заголовком группы.
+        return "  \(mark) \(Backend.split(s.name).model)"
+            + (s.health == .ok ? "  \(s.ms) мс" : "")
             + (s.why.isEmpty ? "" : "  — \(s.why)")
     }
 
@@ -463,9 +519,11 @@ final class Monitor {
     }
 
     /// Опрос одной модели. Чистая работа: сеть и запись в историю, ничего общего.
-    private static func probeOne(name: String, kind: Kind, cfg: Config,
+    private static func probeOne(name: String, kind: Kind, backend b: Backend,
                                  discoverTimeout: TimeInterval, probeTimeout: TimeInterval,
-                                 store: Store, knownReason: String?) -> Outcome {
+                                 store: Store) -> Outcome {
+        // В запрос уходит имя модели без шлюза: шлюз знает её под своим именем.
+        let model = Backend.split(name).model
         if kind == .untested {
             return Outcome(kind: .untested, health: .listed, ms: 0,
                            why: "проверка стоила бы генерации — не спрашиваем",
@@ -477,8 +535,8 @@ final class Monitor {
 
         for try_ in tries {
             guard let path = try_.path else { continue }
-            let (st, data, err, dt) = request(url: cfg.url + path, key: cfg.key,
-                                              body: payload(try_, model: name),
+            let (st, data, err, dt) = request(url: b.url + path, key: b.key,
+                                              body: payload(try_, model: model),
                                               timeout: discovering ? discoverTimeout : probeTimeout)
             let ms = Int(dt * 1000)
             if st == 200 {
@@ -503,7 +561,7 @@ final class Monitor {
 
             // Модель молчит — но прежде чем винить её, спросим сам шлюз. Если и он не
             // отвечает, виновата связь, а не модель, и записывать ей отказ нельзя.
-            if st == nil, !gatewayAlive(cfg) {
+            if st == nil, !gatewayAlive(b) {
                 store.append(Sample(t: Int(Date().timeIntervalSince1970), m: name,
                                     ok: false, ms: ms, why: "нет связи с сервером",
                                     st: Health.offline.rawValue))
@@ -596,14 +654,35 @@ final class Monitor {
     // ------------------------------------------------------------- сводка
 
     var answering: Int { models.values.filter { $0.health == .ok }.count }
+
     /// Знаменатель — только те, кого мы правда спрашиваем. Считать в нём картинки и
-    /// речь значит вечно показывать «21/24» на исправном шлюзе.
+    /// речь значит вечно показывать «21/24» на исправном шлюзе; считать модели
+    /// молчащего шлюза — винить их за оборванную связь.
     var testable: Int {
         models.values.filter { $0.health == .ok || $0.health == .failed
                                || $0.health == .refused }.count
     }
+
     var failing: [ModelState] {
         models.values.filter { $0.health == .failed || $0.health == .refused }
             .sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    /// Шлюзы, до которых сейчас не достучались.
+    var deadGateways: [String] {
+        config.backends.map(\.name).filter { gateways[$0]?.ok == false }
+    }
+
+    /// Надпись у значка. Одна строка на всё: сколько отвечает и всё ли в порядке со
+    /// связью. Молчащий шлюз называем прямо — иначе «0/0» выглядит как поломка моделей.
+    var badge: String {
+        if config.backends.isEmpty { return "GPUStack — не настроен" }
+        let dead = deadGateways
+        if dead.count == config.backends.count {
+            return "GPUStack ✗"
+        }
+        let line = "\(answering)/\(testable)"
+        if !dead.isEmpty { return "⚠ " + line + " · нет связи: " + dead.joined(separator: ", ") }
+        return answering == testable ? line : "⚠ " + line
     }
 }

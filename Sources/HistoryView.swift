@@ -117,8 +117,11 @@ private struct HistoryRow: View {
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(row.name).font(.system(size: 12, weight: .medium))
-                Text(row.kind).font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(row.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                // Шлюз стоит рядом с видом: модели разных контуров называются
+                // одинаково, и без этого две строки выглядят как одна и та же.
+                Text(row.backend + " · " + row.kind)
+                    .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             }
             .frame(width: 210, alignment: .leading)
 
@@ -182,6 +185,7 @@ final class HistoryModel: ObservableObject {
     struct Row: Identifiable {
         let id: String
         let name: String
+        let backend: String
         let kind: String
         let strip: [Mark]
         /// Начало периода и ширина корзины: подсказке нужно сказать, когда это было.
@@ -223,7 +227,9 @@ final class HistoryModel: ObservableObject {
             case .some(let v) where v >= 0.90: color = .orange
             default: color = .red
             }
-            out.append(Row(id: name, name: name, kind: s.kind.title,
+            let parts = Backend.split(name)
+            out.append(Row(id: name, name: parts.model, backend: parts.backend,
+                           kind: s.kind.title,
                            strip: strip, from: from,
                            step: period.seconds / Double(period.buckets),
                            uptime: text, uptimeColor: color))

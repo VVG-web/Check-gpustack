@@ -23,11 +23,39 @@ struct Hidden: Codable, Equatable {
     var isEmpty: Bool { !menu && !history }
 }
 
-struct Config: Codable {
-    /// Адрес шлюза. Пусто — приложение ещё не настроено; своего адреса в исходниках нет
-    /// нарочно, чтобы чужой контур не уезжал вместе с кодом.
+/// Один опрашиваемый шлюз.
+///
+/// Имя здесь не украшение: модели с разных шлюзов называются одинаково. `qwen3.8-27b`
+/// на корпоративном кластере и `qwen3.8-27b` на домашней машине — разные модели с
+/// разной доступностью, и без имени шлюза их замеры слились бы в один ряд, а история
+/// показала бы среднее по двум контурам. Поэтому модель зовётся `шлюз/модель`.
+struct Backend: Codable, Equatable, Identifiable {
+    var name: String = ""
     var url: String = ""
     var key: String = ""
+
+    var id: String { name }
+
+    /// Полное имя модели этого шлюза.
+    func qualify(_ model: String) -> String { Backend.qualify(name, model) }
+
+    static func qualify(_ backend: String, _ model: String) -> String {
+        backend.isEmpty ? model : backend + "/" + model
+    }
+
+    /// Разобрать полное имя обратно. Имя без косой черты — наследие времён одного
+    /// шлюза: такие записи принадлежат `gpustack`, под этим именем он и переехал.
+    static func split(_ full: String) -> (backend: String, model: String) {
+        guard let slash = full.firstIndex(of: "/") else { return (Config.legacyName, full) }
+        return (String(full[full.startIndex..<slash]),
+                String(full[full.index(after: slash)...]))
+    }
+}
+
+struct Config: Codable {
+    /// Шлюзы, которые опрашиваем. Пусто — приложение ещё не настроено; своего адреса в
+    /// исходниках нет нарочно, чтобы чужой контур не уезжал вместе с кодом.
+    var backends: [Backend] = []
     /// Список моделей — дёшево: обычный GET, генерации нет. Спрашиваем часто.
     var rosterSeconds: Int = 60
     /// Настоящий запрос к каждой модели — это работа на общем кластере. Спрашиваем редко.
@@ -42,13 +70,36 @@ struct Config: Codable {
     /// по умолчанию. Стоит добавить в настройку новое поле, и старый `config.json`
     /// перестаёт читаться; `load()` молча берёт настройку с нуля, и вместе с ней человек
     /// теряет ключ и адрес шлюза. Проверено на живом файле до того, как это случилось.
+    /// `url` и `key` в списке остаются ради чтения старых файлов: писать их мы больше
+    /// не будем, а прочитать и перенести обязаны.
+    enum CodingKeys: String, CodingKey {
+        case backends, rosterSeconds, probeSeconds, historyDays, hidden, url, key
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(backends, forKey: .backends)
+        try c.encode(rosterSeconds, forKey: .rosterSeconds)
+        try c.encode(probeSeconds, forKey: .probeSeconds)
+        try c.encode(historyDays, forKey: .historyDays)
+        try c.encode(hidden, forKey: .hidden)
+    }
+
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = Config()
-        url = try c.decodeIfPresent(String.self, forKey: .url) ?? d.url
-        key = try c.decodeIfPresent(String.self, forKey: .key) ?? d.key
+        // Переезд со старой настройки на один шлюз. Имя ему — `gpustack`: под ним же
+        // переписываются старые замеры, иначе месяц истории остался бы ничейным.
+        if let list = try c.decodeIfPresent([Backend].self, forKey: .backends) {
+            backends = list
+        } else {
+            let url = try c.decodeIfPresent(String.self, forKey: .url) ?? ""
+            let key = try c.decodeIfPresent(String.self, forKey: .key) ?? ""
+            backends = url.isEmpty ? []
+                : [Backend(name: Config.legacyName, url: url, key: key)]
+        }
         rosterSeconds = try c.decodeIfPresent(Int.self, forKey: .rosterSeconds) ?? d.rosterSeconds
         probeSeconds = try c.decodeIfPresent(Int.self, forKey: .probeSeconds) ?? d.probeSeconds
         historyDays = try c.decodeIfPresent(Int.self, forKey: .historyDays) ?? d.historyDays
@@ -59,6 +110,16 @@ struct Config: Codable {
 
     func hiddenFromMenu(_ model: String) -> Bool { hidden[model]?.menu ?? false }
     func hiddenFromHistory(_ model: String) -> Bool { hidden[model]?.history ?? false }
+
+    /// Имя, под которым живёт единственный шлюз прежних версий — и все старые замеры.
+    static let legacyName = "gpustack"
+
+    /// Настроен ли монитор хоть одним шлюзом с адресом.
+    var ready: Bool {
+        backends.contains { !$0.url.trimmingCharacters(in: .whitespaces).isEmpty }
+    }
+
+    func backend(named: String) -> Backend? { backends.first { $0.name == named } }
 
     mutating func hide(_ model: String) { hidden[model] = Hidden() }
     mutating func show(_ model: String) { hidden.removeValue(forKey: model) }

@@ -9,6 +9,10 @@ import AppKit
 ///   swiftc -o /tmp/check_update Sources/Config.swift Sources/Store.swift \
 ///       Sources/Updater.swift Tests/check_update.swift
 ///   GPUSTACK_SOURCE_PATH=<клон> /tmp/check_update
+///
+/// Клон должен быть ЧИСТЫМ: обновление начинается с `git pull --ff-only`, и на
+/// незакоммиченных правках оно правильно отказывается работать, чтобы их не затереть.
+/// Поэтому после копирования рабочего дерева в клон правки там надо закоммитить.
 @main
 struct CheckUpdate {
     static var failures = 0
