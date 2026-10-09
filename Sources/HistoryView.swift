@@ -71,13 +71,23 @@ struct HistoryView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(model.rows) { row in
-                            HistoryRow(row: row)
+                            HistoryRow(row: row) { model.hovered = $0 }
                             Divider().opacity(0.4)
                         }
                     }
                 }
             }
             Divider()
+            // Подробности и легенда делят одно место и одну высоту: иначе окно
+            // подпрыгивало бы под курсором на каждом наведении.
+            if let hovered = model.hovered {
+                Text(hovered)
+                    .font(.system(size: 11))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, minHeight: 52, alignment: .topLeading)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+            } else {
             HStack(spacing: 14) {
                 HStack(spacing: 5) {
                     Text("ответила:").font(.system(size: 10)).foregroundStyle(.secondary)
@@ -96,7 +106,9 @@ struct HistoryView: View {
                 Legend(color: Color.secondary.opacity(0.22), text: "не спрашивали")
                 Spacer()
             }
+            .frame(minHeight: 52, alignment: .leading)
             .padding(.horizontal, 12).padding(.vertical, 8)
+            }
         }
         .frame(minWidth: 720, minHeight: 420)
     }
@@ -114,6 +126,9 @@ private struct Legend: View {
 
 private struct HistoryRow: View {
     let row: HistoryModel.Row
+    /// Куда сообщать, на какой сектор навели. Текст показывает окно, а не строка:
+    /// три строки подробностей в полосу высотой двадцать два пикселя не поместятся.
+    let onHover: (String?) -> Void
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 1) {
@@ -133,9 +148,16 @@ private struct HistoryRow: View {
                 HStack(spacing: 0.5) {
                     ForEach(Array(row.strip.enumerated()), id: \.offset) { i, m in
                         Rectangle().fill(Palette.of(m)).frame(width: max(1, w - 0.5))
-                            // Цвет говорит «насколько», подсказка — «сколько именно».
-                            // Без точного числа у человека нет способа отличить 2.1 с
-                            // от 9.9 с, а это разные новости.
+                            // `contentShape` обязателен: без него наведение ловит только
+                            // закрашенную часть, а у пустых корзин закрашивать нечего —
+                            // именно про них и спрашивают чаще всего.
+                            .contentShape(Rectangle())
+                            .onHover { inside in
+                                onHover(inside ? row.name + " · " + hint(i, m) : nil)
+                            }
+                            // Системную подсказку оставляем запасным путём: она
+                            // появляется с задержкой и три строки показывает плохо,
+                            // поэтому главным сделана своя полоса внизу окна.
                             .help(hint(i, m))
                     }
                 }
@@ -205,6 +227,8 @@ final class HistoryModel: ObservableObject {
     @Published var rows: [Row] = []
     @Published var subtitle = ""
     @Published var hiddenNote = ""
+    /// На какой сектор сейчас наведена мышь. Пусто — показываем легенду.
+    @Published var hovered: String?
 
     private let monitor: Monitor
     init(monitor: Monitor) { self.monitor = monitor; reload() }

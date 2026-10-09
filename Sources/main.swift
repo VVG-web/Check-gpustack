@@ -273,6 +273,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                          styleMask: [.titled, .closable, .resizable, .miniaturizable],
                          backing: .buffered, defer: false)
         w.title = "Доступность моделей GPUStack"
+        // Без этого окно приложения без значка в доке не получает движений мыши, и
+        // наведение на сектор не срабатывает вовсе — ни своей подсказкой, ни системной.
+        w.acceptsMouseMovedEvents = true
         w.contentViewController = NSHostingController(rootView: HistoryView(model: m))
         w.center(); w.isReleasedWhenClosed = false
         historyWindow = w
