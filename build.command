@@ -5,18 +5,24 @@ set -e
 cd "$(dirname "$0")"
 
 APP="GPUStack Монитор.app"
-BIN="$APP/Contents/MacOS/GPUStackMonitor"
 
 if ! command -v swiftc >/dev/null; then
   echo "Нет swiftc. Поставьте инструменты разработчика: xcode-select --install"
   exit 1
 fi
 
-echo "Собираю…"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# Собираем РЯДОМ и подменяем только на успехе.
+#
+# Раньше готовое приложение сносилось первой же строкой, и ошибка компиляции оставляла
+# человека без приложения вовсе: было рабочее — стало пусто. Проверка обновления это и
+# поймала. Теперь неудачная сборка не стоит ничего.
+NEW="$APP.new"
+trap 'rm -rf "$NEW"' EXIT
+rm -rf "$NEW"
+mkdir -p "$NEW/Contents/MacOS" "$NEW/Contents/Resources"
 
-swiftc -O -o "$BIN" Sources/*.swift
+echo "Собираю…"
+swiftc -O -o "$NEW/Contents/MacOS/GPUStackMonitor" Sources/*.swift
 
 # Иконка. Нет .icns — рисуем его из Tools/make-icon.swift: рисунок один, размеры от 16
 # до 1024 получаются из него. Без иконки приложение выглядит белым пятном в Launchpad.
@@ -27,9 +33,9 @@ if [ ! -f Resources/AppIcon.icns ]; then
   /tmp/gsm-make-icon Resources
   iconutil -c icns Resources/AppIcon.iconset -o Resources/AppIcon.icns
 fi
-cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp Resources/AppIcon.icns "$NEW/Contents/Resources/AppIcon.icns"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$NEW/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -96,7 +102,17 @@ fi
 # запуске. Ad-hoc подпись бесплатна и снимает именно это.
 # Подпись с ПОСТОЯННЫМ идентификатором. Без него каждая пересборка — новое приложение
 # для macOS, и разрешение на локальную сеть, выданное вчера, сегодня уже не про нас.
-codesign --force --sign - --identifier local.gpustack.monitor "$APP" 2>/dev/null || true
+# Откуда это собрано. Установленное приложение лежит в «Программах» и само по себе не
+# знает, где исходники, — а пункту «Обновить» без этого некуда идти за новой версией.
+# Путь записывается при сборке: он известен ровно здесь и ровно сейчас.
+printf '%s\n' "$PWD" > "$NEW/Contents/Resources/source-path.txt"
+
+codesign --force --sign - --identifier local.gpustack.monitor "$NEW" 2>/dev/null || true
+
+# Всё получилось — только теперь трогаем прежнее.
+rm -rf "$APP"
+mv "$NEW" "$APP"
+trap - EXIT
 
 echo "Готово: $PWD/$APP"
 echo "Запустить: двойной клик по нему. Значок появится в строке меню справа."

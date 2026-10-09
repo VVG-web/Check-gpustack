@@ -14,6 +14,9 @@ enum Palette {
         case .ok: return speed(Speed.of(max(m.ms, 1)))
         case .failed: return .red
         case .refused: return Color(red: 0.69, green: 0.32, blue: 0.87)
+        // Связи не было — клетка пустая. Про модель мы в этот момент не знаем ничего,
+        // и любой цвет здесь был бы утверждением, которого у нас нет.
+        case .offline: return Color.secondary.opacity(0.10)
         case .listed: return .blue.opacity(0.35)
         case .unknown: return Color.secondary.opacity(0.18)
         }
@@ -89,6 +92,7 @@ struct HistoryView: View {
                 Divider().frame(height: 12)
                 Legend(color: .red, text: "не ответила")
                 Legend(color: Color(red: 0.69, green: 0.32, blue: 0.87), text: "отказала")
+                Legend(color: Color.secondary.opacity(0.10), text: "нет связи с сервером")
                 Legend(color: Color.secondary.opacity(0.22), text: "не спрашивали")
                 Spacer()
             }
@@ -151,6 +155,7 @@ private struct HistoryRow: View {
         case .ok: what = "ответила за " + Self.human(m.ms)
         case .failed: what = "не ответила"
         case .refused: what = "ответила и отказала"
+        case .offline: what = "сервера не было — связь оборвана"
         case .listed: what = "не проверяется"
         case .unknown: what = "не спрашивали"
         }

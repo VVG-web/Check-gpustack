@@ -100,6 +100,45 @@ struct CheckStrip {
         check(mixed[1].health == .unknown || mixed[2].health == .unknown,
               "между успехом и отказом пустота остаётся пустотой")
 
+        // --- «нет связи» не должно превращаться в плохую модель
+        let e = Store()
+        let base = now - 5000
+        // сутки без связи плюс два удачных замера
+        for k in 0..<20 {
+            e.append(Sample(t: base + k * 100, m: "Д", ok: false, ms: 0,
+                            why: "нет связи", st: Health.offline.rawValue))
+        }
+        e.append(Sample(t: base + 2100, m: "Д", ok: true, ms: 150, why: nil))
+        e.append(Sample(t: base + 2200, m: "Д", ok: true, ms: 160, why: nil))
+        let up = e.uptime("Д", since: Date(timeIntervalSince1970: Double(base - 10)))
+        check(up == 1.0,
+              "оборванная связь не роняет доступность модели: 100 %, а не 9 % — "
+              + "получилось \(up.map { String(format: "%.0f %%", $0 * 100) } ?? "нет")")
+
+        // только отсутствие связи и ничего больше — числа нет, а не ноль
+        let f = Store()
+        f.append(Sample(t: base, m: "Е", ok: false, ms: 0, why: "нет связи",
+                        st: Health.offline.rawValue))
+        check(f.uptime("Е", since: Date(timeIntervalSince1970: Double(base - 10))) == nil,
+              "без единого настоящего замера доступности нет, а не ноль процентов")
+
+        // в полосе: любой настоящий замер важнее, чем «связи не было»
+        let g = Store()
+        g.append(Sample(t: base + 10, m: "Ж", ok: false, ms: 0, why: "нет связи",
+                        st: Health.offline.rawValue))
+        let only = g.strip("Ж", from: Date(timeIntervalSince1970: Double(base)),
+                           to: Date(timeIntervalSince1970: Double(base + 100)), buckets: 1)
+        check(only[0].health == .offline, "обрыв связи виден как обрыв связи")
+        g.append(Sample(t: base + 20, m: "Ж", ok: true, ms: 120, why: nil))
+        let mixed2 = g.strip("Ж", from: Date(timeIntervalSince1970: Double(base)),
+                             to: Date(timeIntervalSince1970: Double(base + 100)), buckets: 1)
+        check(mixed2[0].health == .ok,
+              "в той же корзине удачный ответ перевешивает «связи не было»")
+        g.append(Sample(t: base + 30, m: "Ж", ok: false, ms: 0, why: "молчит"))
+        let worst = g.strip("Ж", from: Date(timeIntervalSince1970: Double(base)),
+                            to: Date(timeIntervalSince1970: Double(base + 100)), buckets: 1)
+        check(worst[0].health == .failed, "настоящий отказ модели по-прежнему главнее всего")
+
         print(failures == 0 ? "\nВсё сошлось." : "\nПровалов: \(failures)")
         exit(failures == 0 ? 0 : 1)
     }

@@ -15,6 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var historyModel: HistoryModel?
     private var settingsWindow: NSWindow?
     private var helpWindow: NSWindow?
+    private var updateStatus = Updater.Status()
+    private var updating = false
     private var firstEver = false
     private var shownOnce = false
     private var settingsModel: SettingsModel?
@@ -55,6 +57,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         firstEver = !FileManager.default.fileExists(
             atPath: Config.dir.appendingPathComponent("history.jsonl").path)
         monitor.refreshRoster()
+        checkForUpdate()
+        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            self?.checkForUpdate()
+        }
     }
 
     /// Самый первый запуск на машине — единственный раз, когда окно показывается само.
@@ -156,6 +162,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add(menu, "Проверить сейчас", #selector(checkNow), key: "r")
         add(menu, "Настройки…", #selector(openSettings), key: ",")
         add(menu, "Справка", #selector(openHelp), key: "?")
+        // Пункт сам говорит, есть ли что забирать: «Обновить» без новостей заставляет
+        // человека жать его наугад и ждать впустую.
+        let up = NSMenuItem(title: updateTitle(), action: #selector(doUpdate),
+                            keyEquivalent: "u")
+        up.target = self
+        up.isEnabled = !updating
+        if updateStatus.hasUpdate { up.attributedTitle = NSAttributedString(
+            string: updateTitle(), attributes: [.font: NSFont.boldSystemFont(ofSize: 13)]) }
+        if !updateStatus.problem.isEmpty { up.toolTip = updateStatus.problem }
+        menu.addItem(up)
         menu.addItem(.separator())
         add(menu, "Выйти", #selector(quit), key: "q")
     }
@@ -172,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch s.health {
         case .ok: mark = "✅"
         case .failed: mark = "✗"
+        case .offline: mark = "⋯"
         case .refused: mark = "⚠️"
         case .listed: mark = "•"
         case .unknown: mark = "…"
@@ -270,6 +287,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = w
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func updateTitle() -> String {
+        if updating { return "Обновляю…" }
+        if !updateStatus.problem.isEmpty { return "Обновить" }
+        if updateStatus.behind > 0 {
+            return "Обновить — есть новая версия"
+        }
+        return "Обновить (у вас последняя)"
+    }
+
+    /// Проверка идёт в фоне и сама по себе ничего не меняет: только подписывает пункт.
+    private func checkForUpdate() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let s = Updater.check()
+            DispatchQueue.main.async {
+                self?.updateStatus = s
+                if s.hasUpdate { Log.say("доступна новая версия: \(s.latest)") }
+                else if !s.problem.isEmpty { Log.say("проверка обновления: \(s.problem)") }
+            }
+        }
+    }
+
+    @objc private func doUpdate() {
+        guard !updating else { return }
+        // Сборка идёт секунды, и всё это время человек не должен гадать, нажалось ли.
+        updating = true
+        item.button?.toolTip = "Обновление: забираю код и собираю…"
+        Log.say("обновление: начал")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Updater.update()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.updating = false
+                Log.say("обновление: " + result.text.split(separator: "\n").first.map(String.init)!)
+                let a = NSAlert()
+                a.messageText = result.restart ? "Обновление готово" : "Обновить не вышло"
+                a.informativeText = result.text
+                if result.restart {
+                    a.addButton(withTitle: "Перезапустить")
+                    a.addButton(withTitle: "Позже")
+                } else {
+                    a.addButton(withTitle: "Понятно")
+                }
+                NSApp.activate(ignoringOtherApps: true)
+                let answer = a.runModal()
+                if result.restart, answer == .alertFirstButtonReturn {
+                    Updater.restartIntoFresh()
+                } else {
+                    self.checkForUpdate()
+                }
+            }
+        }
     }
 
     @objc private func openHelp() {

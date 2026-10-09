@@ -45,6 +45,14 @@ enum Health: String, Codable {
     /// модели на кластере. Показывать их одним красным значит отправлять человека ждать
     /// того, что само не пройдёт.
     case refused
+    /// До самого сервера не достучались: упал VPN, пропала сеть, шлюз выключен.
+    ///
+    /// Отдельно от `failed`, и это не придирка. Когда нет связи, молчат разом все
+    /// модели, и записывать это каждой в отказ — значит винить их за чужую беду:
+    /// доступность падает у двадцати моделей из-за одного оборванного туннеля, а потом
+    /// по этим числам судят об инференсе. Мы про модель в этот момент не знаем ничего —
+    /// так и показываем.
+    case offline
     case listed      // числится в списке, но настоящим запросом её не проверяют
     case unknown     // ещё не спрашивали
 }
@@ -137,7 +145,9 @@ struct Sample: Codable {
 
     var health: Health {
         if ok { return .ok }
-        return st == Health.refused.rawValue ? .refused : .failed
+        if st == Health.refused.rawValue { return .refused }
+        if st == Health.offline.rawValue { return .offline }
+        return .failed
     }
 }
 
@@ -183,9 +193,13 @@ final class Store {
 
     /// Доля успешных опросов за период. `nil` — за это время модель не спрашивали ни
     /// разу: показать «0 %» было бы враньём, это не отказ, а отсутствие замеров.
+    ///
+    /// Замеры без связи с сервером в счёт не идут вовсе — ни в числитель, ни в
+    /// знаменатель. Оборванный туннель не делает модель хуже, а при прежнем счёте сутки
+    /// без VPN уводили доступность всех моделей разом к нулю.
     func uptime(_ model: String, since: Date) -> Double? {
         let from = Int(since.timeIntervalSince1970)
-        let rows = samples().filter { $0.m == model && $0.t >= from }
+        let rows = samples().filter { $0.m == model && $0.t >= from && $0.health != .offline }
         guard !rows.isEmpty else { return nil }
         return Double(rows.filter { $0.ok }.count) / Double(rows.count)
     }
@@ -207,11 +221,18 @@ final class Store {
                 // Время запоминаем всегда, даже если корзина уже красная: тогда при
                 // наведении видно и отказ, и каким был последний удачный ответ.
                 out[i].ms = max(out[i].ms, s.ms)
-                if out[i].health == .unknown { out[i].health = .ok }
+                // Удачный ответ вытесняет и пустоту, и «связи не было»: раз модель
+                // ответила, про связь в этой корзине говорить уже нечего.
+                if out[i].health == .unknown || out[i].health == .offline {
+                    out[i].health = .ok
+                }
             } else if h == .failed {
                 out[i].health = .failed
             } else if h == .refused, out[i].health != .failed {
                 out[i].health = .refused
+            } else if h == .offline, out[i].health == .unknown {
+                // Ниже всех: любой настоящий замер о модели важнее, чем «связи не было».
+                out[i].health = .offline
             }
         }
         return bridgeOutage(out)

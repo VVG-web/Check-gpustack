@@ -225,7 +225,9 @@ final class Monitor {
             }
             // Шлюз молчит — значит, ни одна модель сейчас не доступна, и показывать
             // прошлые зелёные галочки нельзя: они соврут ровно тогда, когда важны.
-            for name in order { models[name]?.health = .failed; models[name]?.why = gatewayWhy }
+            // Шлюз молчит — значит мы сейчас не знаем о моделях ничего. Красить их
+            // отказом нельзя: это чужая беда, и в их доступности её быть не должно.
+            for name in order { models[name]?.health = .offline; models[name]?.why = gatewayWhy }
             onChange?()
             return
         }
@@ -270,6 +272,17 @@ final class Monitor {
         var ms: Int
         var why: String
         var untestedReason: String?
+        /// Связи с сервером не было: остаток круга спрашивать бессмысленно.
+        var offline: Bool = false
+    }
+
+    /// Отвечает ли сам шлюз. Один дешёвый GET без генерации.
+    ///
+    /// Спрашиваем только тогда, когда модель уже молчит: надо понять, чья это беда.
+    /// Молчат разом все — значит упала связь (VPN, сеть, выключенный шлюз), и вины
+    /// модели в этом нет. Отвечает шлюз, а модель нет — вот это её отказ.
+    private static func gatewayAlive(_ cfg: Config) -> Bool {
+        request(url: cfg.url + "/models", key: cfg.key, body: nil, timeout: 10).status == 200
     }
 
     /// Спросить каждую модель по-настоящему. Идёт долго и нагружает кластер — поэтому
@@ -303,7 +316,7 @@ final class Monitor {
             return ($0, s.kind)
         }
         io.async { [weak self] in
-            for (name, kind) in plan {
+            for (index, (name, kind)) in plan.enumerated() {
                 guard let self else { return }
                 let outcome = Self.probeOne(name: name, kind: kind, cfg: cfg,
                                             discoverTimeout: self.discoverTimeout,
@@ -311,6 +324,25 @@ final class Monitor {
                                             store: self.store,
                                             knownReason: nil)
                 DispatchQueue.main.async { self.applyProbe(name: name, outcome: outcome) }
+                guard outcome.offline else { continue }
+                // Связи нет — остальных не спрашиваем. Каждый из них всё равно дождётся
+                // своего таймаута, и круг растянется на четверть часа пустого ожидания:
+                // на живой истории обрыв поэтому и шёл редкими отметками. Остаток круга
+                // отмечаем тем же «связи не было» — это про сеть, а не про модели.
+                Log.say("нет связи со шлюзом — остаток круга пропускаю "
+                        + "(\(plan.count - index - 1) моделей)")
+                let rest = plan.dropFirst(index + 1)
+                let now = Int(Date().timeIntervalSince1970)
+                for (other, otherKind) in rest where otherKind != .untested {
+                    self.store.append(Sample(t: now, m: other, ok: false, ms: 0,
+                                             why: "нет связи с сервером",
+                                             st: Health.offline.rawValue))
+                    let o = Outcome(kind: otherKind, health: .offline, ms: 0,
+                                    why: "сервера не было — связь оборвана",
+                                    untestedReason: nil, offline: true)
+                    DispatchQueue.main.async { self.applyProbe(name: other, outcome: o) }
+                }
+                break
             }
             DispatchQueue.main.async { self?.finishProbe() }
         }
@@ -410,6 +442,7 @@ final class Monitor {
         switch s.health {
         case .ok: mark = "✅"
         case .failed: mark = "✗"
+        case .offline: mark = "⋯"
         case .refused: mark = "⚠️"
         case .listed: mark = "•"
         case .unknown: mark = "…"
@@ -422,6 +455,7 @@ final class Monitor {
         switch h {
         case .ok: return "отвечает"
         case .failed: return "не отвечает"
+        case .offline: return "нет связи с сервером"
         case .refused: return "отвечает и отказывает"
         case .listed: return "не проверяется"
         case .unknown: return "ещё не спрашивали"
@@ -466,6 +500,17 @@ final class Monitor {
             // Пока вид неизвестен, молчание — не отказ, а знак, что мы стучимся не туда:
             // генератор картинок запрос принял и рисует. Идём дальше по видам.
             if st == nil, discovering { silent = true; continue }
+
+            // Модель молчит — но прежде чем винить её, спросим сам шлюз. Если и он не
+            // отвечает, виновата связь, а не модель, и записывать ей отказ нельзя.
+            if st == nil, !gatewayAlive(cfg) {
+                store.append(Sample(t: Int(Date().timeIntervalSince1970), m: name,
+                                    ok: false, ms: ms, why: "нет связи с сервером",
+                                    st: Health.offline.rawValue))
+                return Outcome(kind: kind, health: .offline, ms: 0,
+                               why: "сервера не было — связь оборвана",
+                               untestedReason: nil, offline: true)
+            }
 
             // Сервер ответил и отказал: сломанный шаблон чата, ключ, неверный запрос.
             // Ожиданием это не лечится, и одним красным с молчанием показывать нельзя.
