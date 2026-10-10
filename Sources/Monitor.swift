@@ -54,8 +54,26 @@ final class Monitor {
     private let io = DispatchQueue(label: "gpustack.io", qos: .utility)
     /// Идёт ли опрос прямо сейчас: второй поверх первого удвоил бы нагрузку.
     private var probing = false
+    /// Просьба оборвать идущий круг. Отдельный замок, а не поле состояния: флаг читает
+    /// очередь сети, а состояние живёт на главном потоке, и смешивать их нельзя — на
+    /// этом приложение уже падало раз в сутки.
+    private let abort = Flag()
+    /// Человек нажал «Проверить сейчас», пока шёл круг: начнём заново, как только
+    /// нынешний остановится.
+    private var recheckWhenFree = false
+    /// Идёт ли опрос списка моделей. На недоступном шлюзе он ждёт таймаут, и без этого
+    /// запросы копились бы один на другом — в журнале по три одинаковых строки подряд.
+    private var refreshing = false
     /// Спрашивали ли модели хоть раз с запуска.
     private(set) var probedOnce = false
+
+    /// Признак, который ставит один поток, а читает другой.
+    final class Flag {
+        private let lock = NSLock()
+        private var value = false
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+    }
 
     struct GatewayState {
         var ok = false
@@ -196,6 +214,7 @@ final class Monitor {
     /// `io`, результат возвращается сюда же.
     func refreshRoster() {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard !refreshing else { return }
         let list = config.backends.filter {
             !$0.url.trimmingCharacters(in: .whitespaces).isEmpty
         }
@@ -208,6 +227,7 @@ final class Monitor {
             onChange?()
             return
         }
+        refreshing = true
         let needVersion = Set(list.filter { gateways[$0.name]?.version.isEmpty ?? true }
                                   .map(\.name))
         io.async { [weak self] in
@@ -225,6 +245,7 @@ final class Monitor {
 
     private func applyRoster(_ answers: [(Backend, Int?, Data?, String, String?)]) {
         dispatchPrecondition(condition: .onQueue(.main))
+        refreshing = false
         var fresh: Set<String> = []
         var live: [String: GatewayState] = [:]
 
@@ -233,8 +254,12 @@ final class Monitor {
             if let ver { state.version = ver }
 
             if st != 200 {
-                Log.say("\(b.name): список моделей не получен: "
-                        + (st == nil ? err : "HTTP \(st!)"))
+                // Говорим один раз на обрыв, а не каждые двадцать секунд: повторяющаяся
+                // строка не добавляет знания, а живые события в журнале топит.
+                if gateways[b.name]?.ok != false {
+                    Log.say("\(b.name): список моделей не получен: "
+                            + (st == nil ? err : "HTTP \(st!)"))
+                }
                 state.ok = false
                 state.why = st == nil ? err : "HTTP \(st!)"
                 // У молчания внутреннего адреса две частые причины, и обе не очевидны.
@@ -259,6 +284,7 @@ final class Monitor {
                 continue
             }
 
+            if gateways[b.name]?.ok == false { Log.say("\(b.name): связь вернулась") }
             state.ok = true
             state.why = ""
             live[b.name] = state
@@ -305,7 +331,8 @@ final class Monitor {
     // ---------------------------------------------------- настоящий запрос
 
     /// Что вышло из опроса одной модели. Считается в `io`, применяется на главном.
-    private struct Outcome {
+    /// Не `private` ради проверок — см. `probeOne`.
+    struct Outcome {
         var kind: Kind
         var health: Health
         var ms: Int
@@ -329,12 +356,31 @@ final class Monitor {
     ///
     /// `rediscover` — забыть вид у тех, кого записали в «не проверяются» по молчанию.
     /// Честный 404 не пересматриваем: у эмбеддингов чата не появится.
-    func probeAll(rediscover: Bool = false) {
+    /// `interrupt` — оборвать идущий круг и начать заново. Это право ТОЛЬКО человека.
+    ///
+    /// Расписание обрывать не должно: на недоступном шлюзе круг идёт дольше, чем
+    /// промежуток между кругами, и расписание начало бы обрывать само себя — карусель,
+    /// в которой ни один шлюз не опрашивается до конца. Так и вышло на первой же живой
+    /// проверке, когда правом обрывать обладали оба.
+    ///
+    /// Кнопка же обрывать обязана: когда круг застревает на недоступном шлюзе, нажать
+    /// её без этого бесполезно — ровно тогда, когда она нужнее всего.
+    func probeAll(rediscover: Bool = false, interrupt: Bool = false) {
         dispatchPrecondition(condition: .onQueue(.main))
         // Второй проход поверх первого удвоил бы нагрузку на общий кластер и перемешал
         // бы записи в истории. Один опрос за раз.
-        guard !probing else { Log.say("опрос уже идёт — второй не начинаю"); return }
+        guard !probing else {
+            if interrupt {
+                Log.say("опрос уже идёт — обрываю его по просьбе и начинаю заново")
+                abort.set(true)
+                recheckWhenFree = true
+            } else {
+                Log.say("опрос уже идёт — второй не начинаю")
+            }
+            return
+        }
         probing = true
+        abort.set(false)
         // Кого пересматриваем. По кнопке — всех: человек нажал её именно потому, что
         // сомневается. По расписанию — тех, чья отметка старше суток, и тех, у кого
         // времени нет вовсе (отметки прежних версий: они и были вечными).
@@ -358,9 +404,11 @@ final class Monitor {
         let backends = config.backends
         io.async { [weak self] in
             for b in backends {
-                guard let self, let mine = plan[b.name] else { continue }
+                guard let self, !self.abort.isSet else { break }
+                guard let mine = plan[b.name] else { continue }
                 var broke = false
                 for (index, (full, kind)) in mine.enumerated() {
+                    guard !self.abort.isSet else { break }
                     let outcome = Self.probeOne(name: full, kind: kind, backend: b,
                                                 discoverTimeout: self.discoverTimeout,
                                                 probeTimeout: self.probeTimeout,
@@ -409,16 +457,28 @@ final class Monitor {
 
     private func finishProbe() {
         dispatchPrecondition(condition: .onQueue(.main))
+        let wasAborted = abort.isSet
+        abort.set(false)
         probing = false
         probedOnce = true
+        if wasAborted { Log.say("круг оборван по просьбе") }
         lastProbe = Date()
-        let bad = failing
-        Log.say("опрос: отвечают \(answering) из \(testable)"
-                + (bad.isEmpty ? "" : " · не в порядке: "
-                   + bad.map { "\($0.name) (\($0.why))" }.joined(separator: "; ")))
+        // Итог оборванного круга печатать нельзя: «отвечают 0 из 0» читается как
+        // поломка, хотя мы просто не успели спросить.
+        if !wasAborted {
+            let bad = failing
+            Log.say("опрос: отвечают \(answering) из \(testable)"
+                    + (bad.isEmpty ? "" : " · не в порядке: "
+                       + bad.map { "\($0.name) (\($0.why))" }.joined(separator: "; ")))
+        }
         saveKinds()
         writeSnapshot()
         onChange?()
+        // Человек просил проверить заново, пока шёл прошлый круг. Теперь можно.
+        if recheckWhenFree {
+            recheckWhenFree = false
+            probeAll(rediscover: true, interrupt: false)
+        }
     }
 
     /// Снимок того, что монитор показывает прямо сейчас: значок, меню и таблица истории
@@ -446,7 +506,7 @@ final class Monitor {
         let broken = failing.filter { !config.hiddenFromMenu($0.name) }
         if !broken.isEmpty {
             L.append("### Требуют внимания")
-            for s in broken { L.append(menuLine(s)) }
+            for s in broken { L.append(menuLine(s, full: true)) }
         }
         for b in config.backends {
             let mine = order.filter { Backend.split($0).backend == b.name }
@@ -491,7 +551,7 @@ final class Monitor {
             .write(to: Config.dir.appendingPathComponent("snapshot.txt"), options: .atomic)
     }
 
-    private func menuLine(_ s: ModelState) -> String {
+    private func menuLine(_ s: ModelState, full: Bool = false) -> String {
         let mark: String
         switch s.health {
         case .ok: mark = "✅"
@@ -501,8 +561,9 @@ final class Monitor {
         case .listed: mark = "•"
         case .unknown: mark = "…"
         }
-        // Как в меню: шлюз уже назван заголовком группы.
-        return "  \(mark) \(Backend.split(s.name).model)"
+        // Как в меню: под заголовком со шлюзом имя шлюза лишнее, а в «Требуют
+        // внимания» заголовка нет — там имя полное.
+        return "  \(mark) \(full ? s.name : Backend.split(s.name).model)"
             + (s.health == .ok ? "  \(s.ms) мс" : "")
             + (s.why.isEmpty ? "" : "  — \(s.why)")
     }
@@ -519,7 +580,10 @@ final class Monitor {
     }
 
     /// Опрос одной модели. Чистая работа: сеть и запись в историю, ничего общего.
-    private static func probeOne(name: String, kind: Kind, backend b: Backend,
+    ///
+    /// Не `private` ради проверок: именно здесь решается, чья беда — модели или связи,
+    /// и ошибку в этом решении видно только по минутам простоя на живом контуре.
+    static func probeOne(name: String, kind: Kind, backend b: Backend,
                                  discoverTimeout: TimeInterval, probeTimeout: TimeInterval,
                                  store: Store) -> Outcome {
         // В запрос уходит имя модели без шлюза: шлюз знает её под своим именем.
@@ -532,6 +596,15 @@ final class Monitor {
         let discovering = kind == .unknown
         let tries: [Kind] = discovering ? [.chat, .embedding, .rerank] : [kind]
         var silent = false
+        // Жив ли шлюз — спрашиваем не больше одного раза за опрос модели. Ответ не
+        // меняется между тремя попытками подряд, а стоит он десяти секунд.
+        var gatewayKnown: Bool?
+        func alive() -> Bool {
+            if let gatewayKnown { return gatewayKnown }
+            let answer = gatewayAlive(b)
+            gatewayKnown = answer
+            return answer
+        }
 
         for try_ in tries {
             guard let path = try_.path else { continue }
@@ -555,13 +628,14 @@ final class Monitor {
             // перечень мы берём с самого шлюза.
             if st == 404 { continue }
 
-            // Пока вид неизвестен, молчание — не отказ, а знак, что мы стучимся не туда:
-            // генератор картинок запрос принял и рисует. Идём дальше по видам.
-            if st == nil, discovering { silent = true; continue }
-
-            // Модель молчит — но прежде чем винить её, спросим сам шлюз. Если и он не
-            // отвечает, виновата связь, а не модель, и записывать ей отказ нельзя.
-            if st == nil, !gatewayAlive(b) {
+            // Модель молчит — но прежде чем делать выводы, спросим сам шлюз. Этот
+            // вопрос обязан стоять ПЕРЕД разбором «ищем вид»: раньше он стоял после, и
+            // у модели с неизвестным видом до него не доходило вовсе. Мёртвый шлюз
+            // выглядел как «стучимся не туда»: три эндпоинта по пятнадцать секунд на
+            // каждую модель, обрыва никто не замечал, остаток круга не пропускался, а
+            // следующие шлюзы ждали своей очереди минутами. На живом контуре так и
+            // вышло — один недоступный шлюз остановил опрос остальных.
+            if st == nil, !alive() {
                 store.append(Sample(t: Int(Date().timeIntervalSince1970), m: name,
                                     ok: false, ms: ms, why: "нет связи с сервером",
                                     st: Health.offline.rawValue))
@@ -569,6 +643,10 @@ final class Monitor {
                                why: "сервера не было — связь оборвана",
                                untestedReason: nil, offline: true)
             }
+
+            // Шлюз жив, а модель молчит, и вида её мы ещё не знаем — значит стучимся не
+            // туда: генератор картинок запрос принял и рисует. Идём дальше по видам.
+            if st == nil, discovering { silent = true; continue }
 
             // Сервер ответил и отказал: сломанный шаблон чата, ключ, неверный запрос.
             // Ожиданием это не лечится, и одним красным с молчанием показывать нельзя.

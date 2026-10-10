@@ -138,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let broken = monitor.failing.filter { !monitor.config.hiddenFromMenu($0.name) }
         if !broken.isEmpty {
             head(menu, "Требуют внимания")
-            for s in broken { menu.addItem(row(s)) }
+            for s in broken { menu.addItem(row(s, full: true)) }
             menu.addItem(.separator())
         }
         // Группируем по шлюзу, а внутри — по виду. Пока шлюз один, заголовок с его
@@ -195,7 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return list + " · " + probe
     }
 
-    private func row(_ s: ModelState) -> NSMenuItem {
+    private func row(_ s: ModelState, full: Bool = false) -> NSMenuItem {
         let mark: String
         switch s.health {
         case .ok: mark = "✅"
@@ -207,9 +207,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         var tail = ""
         if s.health == .ok { tail = "  \(s.ms) мс" }
-        // Имя шлюза уже стоит заголовком группы — в каждой строке оно лишнее.
-        let it = NSMenuItem(title: "\(mark) \(Backend.split(s.name).model)\(tail)",
-                            action: nil, keyEquivalent: "")
+        // Под заголовком со шлюзом имя шлюза в строке лишнее. А в «Требуют внимания»
+        // заголовка нет, и там без него не понять, чья это модель: при трёх шлюзах
+        // `qwen3.8-27b` может оказаться любой из трёх.
+        let shown = full ? s.name : Backend.split(s.name).model
+        let it = NSMenuItem(title: "\(mark) \(shown)\(tail)", action: nil, keyEquivalent: "")
         it.toolTip = s.why.isEmpty
             ? (s.health == .ok ? "Ответила за \(s.ms) мс" : nil) : s.why
         // Скрытие живёт в подменю, а не на самой строке. Строка — это состояние модели,
@@ -257,7 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Ручная проверка — повод пересмотреть и тех, кого записали в «не проверяются»
         // по молчанию: человек нажал кнопку, значит сомневается именно в этом.
         monitor.refreshRoster()
-        monitor.probeAll(rediscover: true)
+        monitor.probeAll(rediscover: true, interrupt: true)
     }
 
     @objc private func openHistory() {
