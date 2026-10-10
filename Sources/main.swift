@@ -280,6 +280,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         w.acceptsMouseMovedEvents = true
         w.contentViewController = NSHostingController(rootView: HistoryView(model: m))
         w.center(); w.isReleasedWhenClosed = false
+        // Закрепление — свойство окна, а не вида: уровень окна знает только AppKit.
+        m.onPin = { [weak w] on in
+            w?.level = on ? .floating : .normal
+            Log.say(on ? "окно истории закреплено поверх остальных" : "окно истории откреплено")
+        }
+        w.level = m.pinned ? .floating : .normal
         historyWindow = w
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

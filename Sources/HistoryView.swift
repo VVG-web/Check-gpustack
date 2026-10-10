@@ -48,6 +48,15 @@ struct HistoryView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 260)
+                Toggle(isOn: $model.pinned) {
+                    Image(systemName: model.pinned ? "pin.fill" : "pin")
+                }
+                .toggleStyle(.button)
+                .help(model.pinned
+                      ? "Открепить: окно вернётся к обычному поведению и будет уходить "
+                        + "за другие"
+                      : "Закрепить поверх остальных окон — чтобы смотреть на полосы, "
+                        + "работая в другой программе")
                 Spacer()
                 if !model.hiddenNote.isEmpty {
                     Text(model.hiddenNote).foregroundStyle(.secondary).font(.system(size: 11))
@@ -229,9 +238,28 @@ final class HistoryModel: ObservableObject {
     @Published var hiddenNote = ""
     /// На какой сектор сейчас наведена мышь. Пусто — показываем легенду.
     @Published var hovered: String?
+    /// Держать ли окно поверх остальных. Само окно живёт в AppKit, поэтому здесь только
+    /// выбор человека, а применяет его тот, кто окном владеет.
+    @Published var pinned: Bool { didSet { applyPin() } }
+    /// Кому сообщить, что выбор изменился. Ставит владелец окна.
+    var onPin: ((Bool) -> Void)?
 
     private let monitor: Monitor
-    init(monitor: Monitor) { self.monitor = monitor; reload() }
+
+    init(monitor: Monitor) {
+        self.monitor = monitor
+        pinned = monitor.config.historyPinned
+        reload()
+    }
+
+    /// Запоминаем выбор и просим владельца окна его применить.
+    private func applyPin() {
+        var c = monitor.config
+        guard c.historyPinned != pinned else { onPin?(pinned); return }
+        c.historyPinned = pinned
+        monitor.apply(c)
+        onPin?(pinned)
+    }
 
     func reload() {
         let to = Date(), from = to.addingTimeInterval(-period.seconds)

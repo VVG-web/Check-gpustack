@@ -42,6 +42,17 @@ struct Check {
               "настройка без поля hidden читается, ключ и адрес целы, шлюз стал gpustack")
         check(decoded?.hidden.isEmpty == true,
               "у старой настройки список скрытых пуст, а не сломан")
+        check(decoded?.historyPinned == false,
+              "новое поле берётся по умолчанию, а не ломает чтение старого файла")
+
+        // Выбор «закрепить окно» обязан пережить запись и чтение.
+        var pinned = Config()
+        pinned.historyPinned = true
+        pinned.backends = [Backend(name: "ш", url: "http://ш/v1", key: "к")]
+        let back = try? JSONDecoder().decode(Config.self,
+                                             from: JSONEncoder().encode(pinned))
+        check(back?.historyPinned == true && back?.backends.first?.key == "к",
+              "закрепление и ключ переживают запись настройки")
 
         var cfg = Config()
         cfg.hide("модель-А")

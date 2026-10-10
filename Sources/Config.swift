@@ -61,6 +61,10 @@ struct Config: Codable {
     /// Настоящий запрос к каждой модели — это работа на общем кластере. Спрашиваем редко.
     var probeSeconds: Int = 900
     var historyDays: Int = 90
+    /// Держать ли окно истории поверх остальных. Выбор человека, а не состояние окна:
+    /// закрепляют его ради работы рядом с чем-то ещё, и после перезапуска это нужно
+    /// ровно так же.
+    var historyPinned: Bool = false
     /// Скрытые модели: имя → где именно спрятана.
     var hidden: [String: Hidden] = [:]
 
@@ -74,6 +78,7 @@ struct Config: Codable {
     /// не будем, а прочитать и перенести обязаны.
     enum CodingKeys: String, CodingKey {
         case backends, rosterSeconds, probeSeconds, historyDays, hidden, url, key
+        case historyPinned
     }
 
     func encode(to encoder: Encoder) throws {
@@ -82,6 +87,7 @@ struct Config: Codable {
         try c.encode(rosterSeconds, forKey: .rosterSeconds)
         try c.encode(probeSeconds, forKey: .probeSeconds)
         try c.encode(historyDays, forKey: .historyDays)
+        try c.encode(historyPinned, forKey: .historyPinned)
         try c.encode(hidden, forKey: .hidden)
     }
 
@@ -103,6 +109,8 @@ struct Config: Codable {
         rosterSeconds = try c.decodeIfPresent(Int.self, forKey: .rosterSeconds) ?? d.rosterSeconds
         probeSeconds = try c.decodeIfPresent(Int.self, forKey: .probeSeconds) ?? d.probeSeconds
         historyDays = try c.decodeIfPresent(Int.self, forKey: .historyDays) ?? d.historyDays
+        historyPinned = try c.decodeIfPresent(Bool.self, forKey: .historyPinned)
+            ?? d.historyPinned
         hidden = try c.decodeIfPresent([String: Hidden].self, forKey: .hidden) ?? d.hidden
     }
 
